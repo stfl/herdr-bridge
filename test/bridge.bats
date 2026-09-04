@@ -315,6 +315,8 @@ s.bind(sys.argv[1])' "$HERDR_BRIDGE_RUNTIME_DIR/$(bash -c 'source "$HB_BIN"; pat
 @test "a failed forward leaves no error scratch file behind" {
   export HB_SSH_BIND_FAIL=1
   run "$HB_BIN" --list workbox:api
-  run bash -c "ls '$HERDR_BRIDGE_RUNTIME_DIR'/err.* 2>/dev/null | wc -l"
-  [ "$output" = "0" ]
+  # No wc: BSD pads its count with leading spaces, so comparing against "0"
+  # holds on GNU and fails on macOS, where it arrives as "       0".
+  run bash -c "ls '$HERDR_BRIDGE_RUNTIME_DIR'/err.* 2>/dev/null || true"
+  [ -z "$output" ]
 }
