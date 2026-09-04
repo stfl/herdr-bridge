@@ -1,0 +1,6 @@
+{"id":"cli:agent:list","result":{"type":"agent_list","agents":[
+ {"agent":"claude","agent_status":"idle","pane_id":"w6:pC","tab_id":"w6:tA","workspace_id":"w6",
+  "cwd":"/home/u/src/web","terminal_title_stripped":"web"},
+ {"agent":"agy","agent_status":"working","pane_id":"w6:pD","tab_id":"w6:tB","workspace_id":"w6",
+  "cwd":"/home/u/src/web"}
+]}}

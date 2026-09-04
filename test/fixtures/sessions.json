@@ -1,0 +1,5 @@
+{"sessions":[
+ {"default":true,"name":"default","running":true,"session_dir":"/home/u/.config/herdr","socket_path":"/home/u/.config/herdr/herdr.sock"},
+ {"default":false,"name":"api","running":true,"session_dir":"/home/u/.config/herdr/sessions/api","socket_path":"/home/u/.config/herdr/sessions/api/herdr.sock"},
+ {"default":false,"name":"stopped","running":false,"session_dir":"/home/u/.config/herdr/sessions/stopped","socket_path":"/home/u/.config/herdr/sessions/stopped/herdr.sock"}
+]}

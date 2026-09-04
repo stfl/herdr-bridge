@@ -1,0 +1,12 @@
+#!/bin/sh
+# A date(1) that behaves like BSD/macOS: %N is not a conversion, so it
+# survives literally into the output instead of expanding to nanoseconds.
+for a in "$@"; do
+  case "$a" in
+    +*%N*)
+      printf '%s3N\n' "$(/bin/date +%s)"
+      exit 0
+      ;;
+  esac
+done
+exec /bin/date "$@"

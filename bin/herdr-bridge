@@ -1,0 +1,564 @@
+#!/usr/bin/env bash
+#
+# herdr-bridge — show a remote herdr agent inside a local herdr pane.
+#
+# herdr has no notion of merging two sessions: each named session is its own
+# server, and the sidebar renders exactly one of them. Reaching a session on
+# another machine means either a nested TUI or a separate window, and in both
+# cases the remote agents stay outside the local agent panel.
+#
+# This assembles the missing behaviour from three primitives herdr already
+# exposes:
+#
+#   1. the session's two unix sockets, forwarded over one multiplexed SSH
+#      connection, which lets the local `herdr` CLI drive a remote server;
+#   2. direct terminal attach, which streams one remote pane into the terminal
+#      it is run from — here, a local herdr pane;
+#   3. `herdr pane report-agent`, the same API official integrations use, which
+#      publishes an agent's identity and lifecycle state onto a pane.
+#
+# The result is a remote agent occupying a local pane and appearing in the
+# local sidebar next to local ones, tagged with the host it runs on. Nothing is
+# nested, so the local client keeps the prefix key.
+#
+#   herdr-bridge workbox:api            the session's only agent
+#   herdr-bridge workbox:api:w5:p1      a specific remote pane
+#   herdr-bridge --list workbox          sessions on a host
+#
+# https://github.com/stfl/herdr-bridge
+
+set -euo pipefail
+
+readonly PROG="herdr-bridge"
+readonly VERSION="0.0.1"
+
+# Defaults, overridable per run.
+interval=1
+ttl_ms=15000
+takeover=0
+
+# ---------------------------------------------------------------- diagnostics
+
+die() {
+  printf '%s: %s\n' "$PROG" "$*" >&2
+  exit 1
+}
+
+version() { printf '%s %s\n' "$PROG" "$VERSION"; }
+
+usage() {
+  cat <<EOF
+$PROG — show a remote herdr agent inside a local herdr pane
+
+usage:
+  $PROG [options] <host>[:<session>[:<remote-pane>]]
+  $PROG --list [<host>[:<session>]]
+  $PROG --release
+
+arguments:
+  host          ssh target running a herdr server
+  session       named herdr session on that host (default: "default")
+  remote-pane   pane id of the agent to bridge, e.g. w5:p1
+                omitted: used automatically when the session holds one agent
+
+options:
+  --list        list sessions on a host, or agents in a session
+  --release     clear a mirrored row stuck on this pane after a hard kill
+  --takeover    take input ownership if another client already owns the pane
+  --interval N  seconds between state polls (default: $interval)
+  --ttl N       ms before a mirrored sidebar row expires (default: $ttl_ms)
+  -V, --version print version
+  -h, --help    this text
+
+environment:
+  HERDR_BRIDGE_HOSTS  space-separated hosts offered first by completion
+
+Run it from inside a herdr pane; that pane is the one the remote agent takes
+over. The mirrored row is released when this exits, including on ctrl-c and on
+a detach from the remote pane. A hard kill (SIGKILL) can leave the row behind;
+"$PROG --release" clears it from the pane it is stuck on.
+EOF
+}
+
+# ------------------------------------------------------------- pure  helpers
+
+# Splits <host>[:<session>[:<pane>]] into TARGET_HOST/SESSION/PANE. A pane id
+# carries a colon of its own (w5:p1), so the pane takes the whole remainder.
+parse_target() {
+  local target="${1-}" rest
+  [ -n "$target" ] || die "empty target (expected <host>[:<session>[:<pane>]])"
+
+  TARGET_HOST="${target%%:*}"
+  [ -n "$TARGET_HOST" ] || die "empty host in target \"$target\""
+
+  if [ "$TARGET_HOST" = "$target" ]; then
+    TARGET_SESSION="default"
+    TARGET_PANE=""
+    return 0
+  fi
+
+  rest="${target#*:}"
+  TARGET_SESSION="${rest%%:*}"
+  [ -n "$TARGET_SESSION" ] || die "empty session in target \"$target\""
+
+  if [ "$TARGET_SESSION" = "$rest" ]; then
+    TARGET_PANE=""
+  else
+    TARGET_PANE="${rest#*:}"
+    [ -n "$TARGET_PANE" ] || die "empty pane in target \"$target\""
+  fi
+}
+
+# herdr reports "done" for an agent that finished work the UI has not shown
+# yet; it is the same underlying state as idle, and not a value report-agent
+# accepts.
+map_state() {
+  case "${1-}" in
+    idle | working | blocked) printf '%s' "$1" ;;
+    done) printf 'idle' ;;
+    *) printf 'unknown' ;;
+  esac
+}
+
+# The streaming commands derive the client socket from HERDR_SOCKET_PATH by
+# name, so a forwarded pair has to keep herdr's own spelling.
+client_socket() { printf '%s-client.sock' "${1%.sock}"; }
+
+# Sockets live under this directory, so it has to be short: sun_path caps a
+# unix socket path at 108 bytes, and macOS's per-user temp directory
+# (/var/folders/<hash>/<hash>/T) spends most of that before a filename exists.
+# A long XDG_RUNTIME_DIR is therefore traded for a short, user-owned path.
+runtime_dir() {
+  local base dir
+  base="${XDG_RUNTIME_DIR:-}"
+  if [ -n "$base" ]; then
+    dir="$base/herdr-bridge"
+    if [ "${#dir}" -le 48 ]; then
+      printf '%s' "$dir"
+      return 0
+    fi
+  fi
+  printf '/tmp/herdr-bridge-%s' "$(id -u)"
+}
+
+ensure_runtime_dir() {
+  local dir
+  dir=$(runtime_dir)
+  mkdir -p "$dir" 2>/dev/null || die "cannot create $dir"
+  # The fallback lives in /tmp, which everyone can write to, so refuse
+  # anything that is not a real directory belonging to this user.
+  { [ -d "$dir" ] && [ ! -L "$dir" ] && [ -O "$dir" ]; } ||
+    die "$dir is not a directory owned by this user; refusing to use it"
+  chmod 700 "$dir"
+}
+
+# sun_path holds 108 bytes. The client socket is the longer of the pair, so it
+# decides whether the names fit.
+local_socket() {
+  local host="$1" session="$2" sock
+  sock="$(runtime_dir)/$host-$session.sock"
+  [ "${#sock}" -lt 96 ] ||
+    die "socket path too long for a unix socket: $(client_socket "$sock")"
+  printf '%s' "$sock"
+}
+
+# A monotonic sequence shared by processes that cannot see each other's
+# counters: the mirror publishes with it, and cleanup outranks the mirror's
+# last publish with it.
+now_ms() { date +%s%3N; }
+
+# ---------------------------------------------------------------------- ssh
+
+# Fills SSH_OPTS with the connection options for <host>: one multiplexed
+# connection per host, reused by every pane bridging it and by tab-completion,
+# so repeat calls cost a round trip rather than a handshake.
+#
+# The array is filled in place rather than printed and read back, because
+# reading a NUL-delimited stream into an array needs `mapfile -d`, which bash
+# 3.2 — still the system shell on macOS — does not have.
+ssh_opts() {
+  SSH_OPTS=(-o ControlMaster=auto
+    -o "ControlPath=$(runtime_dir)/ssh-$1.ctl"
+    -o ControlPersist=120)
+  if [ "${BATCH:-0}" = 1 ]; then
+    SSH_OPTS+=(-o BatchMode=yes)
+  fi
+}
+
+rssh() {
+  local host="$1"
+  shift
+  ssh_opts "$host"
+  # Callers pass literal herdr subcommands, never interpolated data, so
+  # client-side expansion of the remote word list is what is wanted here.
+  # shellcheck disable=SC2029
+  ssh "${SSH_OPTS[@]}" "$host" "$@"
+}
+
+# ---------------------------------------------------------------- discovery
+
+session_socket() {
+  local host="$1" session="$2" json
+  json=$(rssh "$host" herdr session list --json) ||
+    die "cannot reach herdr on $host (try: ssh $host herdr status)"
+  jq -er --arg n "$session" '
+    (.sessions[] | select(.name == $n))
+    | if .running then .socket_path else error("not running") end
+  ' <<<"$json" 2>/dev/null ||
+    die "no running session \"$session\" on $host — see: $PROG --list $host"
+}
+
+agents_tsv() {
+  HERDR_SOCKET_PATH="$1" herdr agent list | jq -r '
+    .result.agents[]
+    | [ .pane_id, .agent, .agent_status,
+        (.terminal_title_stripped // .cwd // "") ]
+    | @tsv'
+}
+
+pick_agent() {
+  local sock="$1" tsv count
+  tsv=$(agents_tsv "$sock") || die "cannot list agents"
+  count=$(printf '%s' "$tsv" | grep -c . || true)
+  case "$count" in
+    0) die "no agents in that session" ;;
+    1) printf '%s' "$tsv" | cut -f1 ;;
+    *)
+      printf '%s: session holds %s agents — name one:\n' "$PROG" "$count" >&2
+      printf '%s\n' "$tsv" |
+        awk -F'\t' '{printf "  %-10s %-8s %s\n", $1, $2, $4}' >&2
+      exit 1
+      ;;
+  esac
+}
+
+# -------------------------------------------------------------- forwarding
+
+# `herdr status server` reports a dead socket on stdout and still exits 0, so
+# the exit code alone cannot answer this.
+socket_alive() {
+  [ -S "$1" ] || return 1
+  HERDR_SOCKET_PATH="$1" herdr status server 2>/dev/null |
+    grep -q '^status: running'
+}
+
+wait_for_socket() {
+  local sock="$1" _
+  for _ in $(seq 1 50); do
+    if socket_alive "$sock"; then return 0; fi
+    sleep 0.1
+  done
+  die "forwarded socket never answered: $sock"
+}
+
+ensure_forward() {
+  local host="$1" session="$2" remote_sock="$3" sock csock
+  sock=$(local_socket "$host" "$session") || exit 1
+  csock=$(client_socket "$sock")
+
+  # Panes bridging the same session race to create the same forward.
+  exec 9>"$(runtime_dir)/$host-$session.lock"
+  flock 9
+
+  if ! socket_alive "$sock"; then
+    rm -f "$sock" "$csock"
+    ssh_opts "$host"
+    ssh "${SSH_OPTS[@]}" -o ExitOnForwardFailure=yes -fnNT \
+      -L "$sock:$remote_sock" \
+      -L "$csock:$(client_socket "$remote_sock")" \
+      "$host" || die "failed to forward $host:$session sockets"
+    wait_for_socket "$sock"
+  fi
+
+  exec 9>&-
+  printf '%s' "$sock"
+}
+
+# --------------------------------------------------------------- mirroring
+
+# Republish the remote agent's identity and state onto the local pane, so the
+# local sidebar carries it like any agent of its own. One poll, one publish.
+publish() {
+  local sock="$1" rpane="$2" host="$3" session="$4" lpane="$5" source="$6"
+  local seq json agent state sid title
+  local -a report meta
+
+  json=$(HERDR_SOCKET_PATH="$sock" herdr agent get "$rpane" 2>/dev/null) ||
+    return 1
+
+  agent=$(jq -r '.result.agent.agent // "unknown"' <<<"$json")
+  state=$(map_state "$(jq -r '.result.agent.agent_status // ""' <<<"$json")")
+  sid=$(jq -r '.result.agent.agent_session.value // empty' <<<"$json")
+  title=$(jq -r '.result.agent.terminal_title_stripped // empty' <<<"$json")
+  seq=$(now_ms)
+
+  report=(pane report-agent "$lpane" --source "$source"
+    --agent "$agent" --state "$state" --seq "$seq")
+  if [ -n "$sid" ]; then report+=(--agent-session-id "$sid"); fi
+  herdr "${report[@]}" >/dev/null 2>&1 || true
+
+  meta=(pane report-metadata "$lpane" --source "$source" --agent "$agent"
+    --display-agent "$agent@$host"
+    --token "host=$host" --token "session=$session"
+    --seq "$seq" --ttl-ms "$ttl_ms")
+  if [ -n "$title" ]; then meta+=(--title "$title"); fi
+  herdr "${meta[@]}" >/dev/null 2>&1 || true
+}
+
+mirror() {
+  while :; do
+    sleep "$interval"
+    publish "$@" || true
+  done
+}
+
+cleaned=0
+cleanup() {
+  [ "$cleaned" = 0 ] || return 0
+  cleaned=1
+  if [ -n "${attach_pid:-}" ]; then kill "$attach_pid" 2>/dev/null || true; fi
+  # SIGKILL, not SIGTERM: a mirror blocked on a forwarded socket over a dead
+  # link would otherwise hold up the release for as long as that call takes to
+  # time out.
+  if [ -n "${mirror_pid:-}" ]; then
+    kill -KILL "$mirror_pid" 2>/dev/null || true
+    wait "$mirror_pid" 2>/dev/null || true
+  fi
+  # A report the mirror had already sent can still land after this, so the
+  # release carries a sequence number well ahead of any of them.
+  if [ -n "${lpane:-}" ] && [ -n "${source_id:-}" ] && [ -n "${agent:-}" ]; then
+    herdr pane release-agent "$lpane" --source "$source_id" --agent "$agent" \
+      --seq "$(($(now_ms) + 60000))" >/dev/null 2>&1 || true
+  fi
+}
+
+# -------------------------------------------------------------- completion
+
+# Every topic emits "value<TAB>description". Tab rather than colon, because
+# remote pane ids are themselves colon-separated and would split at the wrong
+# place.
+complete_hosts() {
+  local self h
+  local -a known=()
+  self=$(uname -n 2>/dev/null || true)
+  if [ -n "${HERDR_BRIDGE_HOSTS:-}" ]; then
+    read -ra known <<<"$HERDR_BRIDGE_HOSTS"
+  fi
+  {
+    for h in ${known[@]+"${known[@]}"}; do
+      printf '%s\therdr host\n' "$h"
+    done
+    if [ -r "$HOME/.ssh/config" ]; then
+      awk 'tolower($1) == "host" {
+             for (i = 2; i <= NF; i++) if ($i !~ /[*?!]/) print $i "\tssh config"
+           }' "$HOME/.ssh/config"
+    fi
+  } | awk -F'\t' -v self="$self" 'NF && $1 != self && !seen[$1]++'
+}
+
+complete_sessions() {
+  BATCH=1 rssh "$1" herdr session list --json 2>/dev/null | jq -r '
+    .sessions[]
+    | select(.running)
+    | [ .name, (if .default then "running · default" else "running" end) ]
+    | @tsv'
+}
+
+complete_agents() {
+  local host="$1" session="$2" sock
+  sock=$(BATCH=1 session_socket "$host" "$session") || return 1
+  sock=$(ensure_forward "$host" "$session" "$sock") || return 1
+  agents_tsv "$sock" |
+    awk -F'\t' '{printf "%s\t%s · %s · %s\n", $1, $2, $3, $4}'
+}
+
+# -------------------------------------------------------------- subcommands
+
+cmd_complete() {
+  BATCH=1
+  export BATCH
+  case "${1-}" in
+    hosts) complete_hosts ;;
+    sessions) complete_sessions "${2:?host required}" ;;
+    agents) complete_agents "${2:?host required}" "${3:?session required}" ;;
+    *) die "unknown completion topic: ${1-}" ;;
+  esac
+}
+
+cmd_list() {
+  local target="${1-}" sock
+  [ -n "$target" ] || die "usage: $PROG --list <host>[:<session>]"
+
+  if [ "${target%%:*}" = "$target" ]; then
+    rssh "$target" herdr session list
+    return 0
+  fi
+
+  parse_target "$target"
+  [ -z "$TARGET_PANE" ] || die "--list takes <host>[:<session>], not a pane"
+  sock=$(session_socket "$TARGET_HOST" "$TARGET_SESSION") || exit 1
+  sock=$(ensure_forward "$TARGET_HOST" "$TARGET_SESSION" "$sock") || exit 1
+  agents_tsv "$sock" | awk -F'\t' '
+    BEGIN { printf "%-10s %-8s %-8s %s\n", "PANE", "AGENT", "STATE", "TITLE" }
+          { printf "%-10s %-8s %-8s %s\n", $1, $2, $3, $4 }'
+}
+
+cmd_release() {
+  local lpane row agent host session
+  lpane="${HERDR_PANE_ID:-}"
+  [ -n "$lpane" ] || die "not inside a herdr pane"
+  row=$(herdr agent get "$lpane" 2>/dev/null) || die "no agent row on $lpane"
+  # The mirror stamps host and session as tokens, which is enough to
+  # reconstruct the source id that owns the row.
+  agent=$(jq -r '.result.agent.agent // empty' <<<"$row")
+  host=$(jq -r '.result.agent.tokens.host // empty' <<<"$row")
+  session=$(jq -r '.result.agent.tokens.session // empty' <<<"$row")
+  { [ -n "$host" ] && [ -n "$session" ]; } ||
+    die "$lpane does not carry a bridged agent"
+  herdr pane release-agent "$lpane" --source "$PROG:$host:$session" \
+    --agent "$agent" --seq "$(($(now_ms) + 60000))"
+  printf '%s: released %s@%s from %s\n' "$PROG" "$agent" "$host" "$lpane"
+}
+
+cmd_attach() {
+  local target="${1-}" remote_sock sock rpane
+  [ -n "$target" ] || {
+    usage >&2
+    exit 1
+  }
+
+  lpane="${HERDR_PANE_ID:-}"
+  [ -n "$lpane" ] ||
+    die "not inside a herdr pane — run this from a herdr session"
+
+  parse_target "$target"
+  remote_sock=$(session_socket "$TARGET_HOST" "$TARGET_SESSION") || exit 1
+  sock=$(ensure_forward "$TARGET_HOST" "$TARGET_SESSION" "$remote_sock") || exit 1
+
+  rpane="$TARGET_PANE"
+  if [ -z "$rpane" ]; then rpane=$(pick_agent "$sock") || exit 1; fi
+
+  agent=$(HERDR_SOCKET_PATH="$sock" herdr agent get "$rpane" |
+    jq -r '.result.agent.agent // empty') ||
+    die "no agent at $rpane in $TARGET_HOST:$TARGET_SESSION"
+  [ -n "$agent" ] ||
+    die "no agent at $rpane in $TARGET_HOST:$TARGET_SESSION"
+
+  source_id="$PROG:$TARGET_HOST:$TARGET_SESSION"
+  trap cleanup EXIT INT TERM HUP
+
+  # Publish once before the attach, so the sidebar carries the agent from the
+  # first frame instead of after the first poll.
+  publish "$sock" "$rpane" "$TARGET_HOST" "$TARGET_SESSION" "$lpane" \
+    "$source_id" || true
+
+  mirror "$sock" "$rpane" "$TARGET_HOST" "$TARGET_SESSION" "$lpane" \
+    "$source_id" &
+  mirror_pid=$!
+
+  local -a attach=(agent attach "$rpane")
+  if [ "$takeover" = 1 ]; then attach+=(--takeover); fi
+
+  # The attach runs asynchronously and is waited on, rather than held in the
+  # foreground: bash services traps only between commands, so a signal
+  # arriving while a blocking child owns the foreground is queued until that
+  # child exits — long enough to leave a stale agent row in the sidebar.
+  # `wait` is interruptible, so the trap fires at once.
+  #
+  # Stdin is redirected explicitly through fd 8. Without a redirection of its
+  # own an asynchronous child gets /dev/null for stdin, which would leave the
+  # attached remote pane with no keyboard.
+  exec 8<&0
+  HERDR_SOCKET_PATH="$sock" herdr "${attach[@]}" <&8 &
+  attach_pid=$!
+  wait "$attach_pid" || true
+}
+
+# --------------------------------------------------------------------- main
+
+require_tools() {
+  local tool
+  for tool in ssh jq flock herdr awk; do
+    command -v "$tool" >/dev/null 2>&1 ||
+      die "$tool is not on PATH; install it and try again"
+  done
+}
+
+is_positive_number() {
+  case "${1-}" in
+    '' | *[!0-9.]* | '.') return 1 ;;
+    *) awk -v v="$1" 'BEGIN { exit !(v + 0 > 0) }' ;;
+  esac
+}
+
+main() {
+  local mode=attach
+  local -a args=()
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -h | --help)
+        usage
+        return 0
+        ;;
+      -V | --version)
+        version
+        return 0
+        ;;
+      --list)
+        mode=list
+        shift
+        ;;
+      --release)
+        mode=release
+        shift
+        ;;
+      --complete)
+        mode=complete
+        shift
+        ;;
+      --takeover)
+        takeover=1
+        shift
+        ;;
+      --interval)
+        interval="${2:-}"
+        is_positive_number "$interval" ||
+          die "--interval expects a positive number of seconds"
+        shift 2
+        ;;
+      --ttl)
+        ttl_ms="${2:-}"
+        is_positive_number "$ttl_ms" ||
+          die "--ttl expects a positive number of milliseconds"
+        shift 2
+        ;;
+      --)
+        shift
+        while [ $# -gt 0 ]; do
+          args+=("$1")
+          shift
+        done
+        ;;
+      -*) die "unknown option: $1 (see --help)" ;;
+      *)
+        args+=("$1")
+        shift
+        ;;
+    esac
+  done
+
+  require_tools
+  ensure_runtime_dir
+
+  case "$mode" in
+    complete) cmd_complete ${args[@]+"${args[@]}"} ;;
+    list) cmd_list ${args[@]+"${args[@]}"} ;;
+    release) cmd_release ;;
+    attach) cmd_attach ${args[@]+"${args[@]}"} ;;
+  esac
+}
+
+if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
+  main "$@"
+fi

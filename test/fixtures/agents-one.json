@@ -1,0 +1,5 @@
+{"id":"cli:agent:list","result":{"type":"agent_list","agents":[
+ {"agent":"claude","agent_status":"done","pane_id":"w5:p1","tab_id":"w5:t1","workspace_id":"w5",
+  "agent_session":{"agent":"claude","kind":"id","source":"herdr:claude","value":"2577af67-6b47-4f89-96bb-412204864866"},
+  "cwd":"/home/u/src/api","terminal_title":"✳ auth middleware","terminal_title_stripped":"auth middleware"}
+]}}

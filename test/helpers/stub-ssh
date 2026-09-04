@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+# Stub ssh. Two shapes are honoured:
+#   ssh [opts] <host> <command...>   -> runs the command locally
+#   ssh [opts] -L a:b [-L c:d] <host> -> creates the local socket files
+set -u
+printf 'ssh %s\n' "$*" >>"${HB_CALLS:-/dev/null}"
+[ "${HB_SSH_FAIL:-0}" = 1 ] && { echo "ssh: connect failed" >&2; exit 255; }
+
+forwards=()
+cmd=()
+host=""
+while [ $# -gt 0 ]; do
+  # Everything after the host is the remote command, options included.
+  if [ -n "$host" ]; then cmd+=("$1"); shift; continue; fi
+  case "$1" in
+    -L) forwards+=("$2"); shift 2 ;;
+    -o | -S | -i | -p | -R | -D | -F | -l) shift 2 ;;
+    -*) shift ;;
+    *) host="$1"; shift ;;
+  esac
+done
+
+for f in ${forwards[@]+"${forwards[@]}"}; do
+  local_sock="${f%%:*}"
+  mkdir -p "$(dirname "$local_sock")"
+  python3 -c 'import socket,sys
+s = socket.socket(socket.AF_UNIX)
+s.bind(sys.argv[1])' "$local_sock"
+done
+
+if [ ${#cmd[@]} -gt 0 ]; then exec "${cmd[@]}"; fi
+exit 0
