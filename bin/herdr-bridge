@@ -165,7 +165,47 @@ local_socket() {
 # A monotonic sequence shared by processes that cannot see each other's
 # counters: the mirror publishes with it, and cleanup outranks the mirror's
 # last publish with it.
-now_ms() { date +%s%3N; }
+#
+# %N is a GNU extension. BSD date, which is what macOS ships, leaves it in the
+# output verbatim, and a non-numeric sequence number would break the
+# arithmetic in teardown. Second resolution is enough for the fallback:
+# publishes are a poll interval apart, and the release adds a whole minute.
+now_ms() {
+  local ms
+  ms=$(date +%s%3N 2>/dev/null || true)
+  case "$ms" in
+    '' | *[!0-9]*) ms="$(date +%s)000" ;;
+  esac
+  printf '%s' "$ms"
+}
+
+# flock(1) is util-linux, so it does not exist on macOS. mkdir is the portable
+# atomic primitive: it either creates the directory or fails, with no window
+# in between.
+LOCK_TIMEOUT="${LOCK_TIMEOUT:-10}"
+
+lock_acquire() {
+  local name="$1" dir owner waited=0
+  dir="$(runtime_dir)/$name.lock"
+  while ! mkdir "$dir" 2>/dev/null; do
+    # A lock whose owner died would otherwise block every later run. The
+    # runtime directory is private to one user, so every holder is ours to
+    # signal.
+    owner=$(cat "$dir/pid" 2>/dev/null || true)
+    if [ -n "$owner" ] && ! kill -0 "$owner" 2>/dev/null; then
+      rm -rf "$dir"
+      continue
+    fi
+    if [ "$waited" -ge "$((LOCK_TIMEOUT * 20))" ]; then
+      die "timed out waiting for the $name lock"
+    fi
+    waited=$((waited + 1))
+    sleep 0.05
+  done
+  printf '%s' "$$" >"$dir/pid"
+}
+
+lock_release() { rm -rf "$(runtime_dir)/$1.lock"; }
 
 # ---------------------------------------------------------------------- ssh
 
@@ -256,9 +296,10 @@ ensure_forward() {
   sock=$(local_socket "$host" "$session") || exit 1
   csock=$(client_socket "$sock")
 
-  # Panes bridging the same session race to create the same forward.
-  exec 9>"$(runtime_dir)/$host-$session.lock"
-  flock 9
+  # Panes bridging the same session race to create the same forward. A run
+  # that dies inside this section leaves the lock behind; the next one
+  # reclaims it once the owning pid is gone.
+  lock_acquire "$host-$session"
 
   if ! socket_alive "$sock"; then
     rm -f "$sock" "$csock"
@@ -270,7 +311,7 @@ ensure_forward() {
     wait_for_socket "$sock"
   fi
 
-  exec 9>&-
+  lock_release "$host-$session"
   printf '%s' "$sock"
 }
 
@@ -476,9 +517,11 @@ cmd_attach() {
 
 # --------------------------------------------------------------------- main
 
+REQUIRED_TOOLS=(ssh jq herdr awk)
+
 require_tools() {
   local tool
-  for tool in ssh jq flock herdr awk; do
+  for tool in "${REQUIRED_TOOLS[@]}"; do
     command -v "$tool" >/dev/null 2>&1 ||
       die "$tool is not on PATH; install it and try again"
   done

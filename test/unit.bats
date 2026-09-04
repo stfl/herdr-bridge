@@ -135,3 +135,56 @@ teardown() { hb_teardown; }
     [ "$status" -ne 0 ]
   done
 }
+@test "a BSD date without %N still yields a numeric millisecond clock" {
+  # macOS date has no %N conversion, so it survives into the output verbatim.
+  # A non-numeric sequence number would break the arithmetic in teardown.
+  # Shadowed as a shell function rather than on PATH, so only the script under
+  # test sees it.
+  run bash -c 'source "$HB_BIN"
+    date() {
+      case "$*" in
+        *N*) printf "17884700003N\n" ;;
+        *) printf "1788470000\n" ;;
+      esac
+    }
+    now_ms'
+  [ "$status" -eq 0 ]
+  [[ "$output" =~ ^[0-9]+$ ]]
+  [ "$output" = "1788470000000" ]
+}
+
+@test "the sequence clock never goes backwards" {
+  run bash -c 'source "$HB_BIN"; a=$(now_ms); b=$(now_ms); [ "$b" -ge "$a" ]'
+  [ "$status" -eq 0 ]
+}
+
+@test "flock is not required, because macOS does not ship it" {
+  run bash -c 'source "$HB_BIN"; printf "%s\n" "${REQUIRED_TOOLS[@]}"'
+  [ "$status" -eq 0 ]
+  [[ "$output" != *flock* ]]
+  [[ "$output" == *jq* ]]
+}
+
+@test "a second holder waits for the lock to be released" {
+  run bash -c 'source "$HB_BIN"
+    ensure_runtime_dir
+    lock_acquire probe
+    ( lock_acquire probe && echo SECOND_ENTERED ) &
+    sleep 0.4
+    echo FIRST_STILL_HOLDS
+    lock_release probe
+    wait'
+  [ "$status" -eq 0 ]
+  [[ "$output" == *FIRST_STILL_HOLDS*SECOND_ENTERED* ]]
+}
+
+@test "a stale lock left by a dead process is broken, not waited on forever" {
+  run bash -c 'source "$HB_BIN"
+    ensure_runtime_dir
+    mkdir -p "$(runtime_dir)/stale.lock"
+    echo 999999 >"$(runtime_dir)/stale.lock/pid"
+    LOCK_TIMEOUT=2 lock_acquire stale && echo ACQUIRED
+    lock_release stale'
+  [ "$status" -eq 0 ]
+  [[ "$output" == *ACQUIRED* ]]
+}
