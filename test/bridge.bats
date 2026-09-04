@@ -217,3 +217,87 @@ s.bind(sys.argv[1])' "$HERDR_BRIDGE_RUNTIME_DIR/$(bash -c 'source "$HB_BIN"; pat
   [ "$status" -ne 0 ]
   [[ "$output" == *"not inside a herdr pane"* ]]
 }
+
+@test "a forward whose socket vanished is repaired, not silently skipped" {
+  # A multiplexing master answers an identical forward request with success
+  # and without rebinding, so asking again cannot restore a path that is
+  # gone — the registration has to be cancelled first.
+  local sock
+  sock=$(bash -c 'source "$HB_BIN"; local_socket workbox api')
+  run "$HB_BIN" --list workbox:api
+  [ "$status" -eq 0 ]
+  [ -S "$sock" ]
+
+  rm -f "$sock"
+  run "$HB_BIN" --list workbox:api
+  [ "$status" -eq 0 ]
+  [ -S "$sock" ]
+}
+
+@test "several bridges starting at once share one forward" {
+  # No lock is taken, because the multiplexing master deduplicates identical
+  # forward requests. This is the property that replaces it: concurrent
+  # starts must all succeed and must not each build their own.
+  local i sock
+  sock=$(bash -c 'source "$HB_BIN"; local_socket workbox api')
+  for i in 1 2 3 4 5 6; do
+    "$HB_BIN" --list workbox:api >>"$TEST_TMP/out.$i" 2>&1 &
+  done
+  wait
+
+  for i in 1 2 3 4 5 6; do
+    grep -q "w5:p1" "$TEST_TMP/out.$i" || {
+      echo "bridge $i did not see the agent:"
+      cat "$TEST_TMP/out.$i"
+      false
+    }
+  done
+  [ -S "$sock" ]
+}
+
+@test "a repaired forward cancels the stale registration first" {
+  local sock
+  sock=$(bash -c 'source "$HB_BIN"; local_socket workbox api')
+  run "$HB_BIN" --list workbox:api
+  rm -f "$sock"
+  run "$HB_BIN" --list workbox:api
+  [ "$status" -eq 0 ]
+  [ -n "$(hb_calls_matching '-O cancel')" ]
+}
+
+@test "a healthy forward is neither cancelled nor rebuilt" {
+  run "$HB_BIN" --list workbox:api
+  : >"$HB_CALLS"
+  run "$HB_BIN" --list workbox:api
+  [ "$status" -eq 0 ]
+  [ -z "$(hb_calls_matching '-O cancel')" ]
+  [ -z "$(hb_calls_matching '-fnNT')" ]
+}
+
+@test "a failed agent listing is an error, not an empty table" {
+  # A header printed before the query succeeds turns a failure into something
+  # that reads as "this session has no agents".
+  : >"$HB_SERVER_DOWN_FILE"
+  HB_SSH_FAIL=1 run "$HB_BIN" --list workbox:api
+  [ "$status" -ne 0 ]
+  [[ "$output" != *PANE*AGENT*STATE* ]]
+}
+
+@test "a stale build mutex does not block forever" {
+  # Left by a process that died mid-build. There is no owner recorded and no
+  # liveness check by design, so it is judged by how long it has been held.
+  local sock
+  sock=$(bash -c 'source "$HB_BIN"; local_socket workbox api')
+  mkdir -p "$sock.building"
+  run bash -c 'source "$HB_BIN"; forward_mutex_wait "'"$sock"'.building" && echo TAKEN'
+  [ "$status" -eq 0 ]
+  [[ "$output" == *TAKEN* ]]
+}
+
+@test "building a forward leaves no mutex behind" {
+  local sock
+  sock=$(bash -c 'source "$HB_BIN"; local_socket workbox api')
+  run "$HB_BIN" --list workbox:api
+  [ "$status" -eq 0 ]
+  [ ! -e "$sock.building" ]
+}

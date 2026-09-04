@@ -30,7 +30,7 @@
 set -euo pipefail
 
 readonly PROG="herdr-bridge"
-readonly VERSION="0.0.2"
+readonly VERSION="0.0.3"
 
 # Defaults, overridable per run.
 interval=1
@@ -210,123 +210,6 @@ now_ms() {
   printf '%s' "$ms"
 }
 
-# flock(1) is util-linux, so it does not exist on macOS. A hard link is the
-# portable atomic primitive: ln fails if the target exists, and the file it
-# publishes already contains the owner's pid — so unlike mkdir there is never
-# a window where a lock exists with no owner recorded.
-#
-# The suffix is deliberately not the one an earlier version used for its
-# directory lock: `ln file existing-directory` creates a file *inside* the
-# directory and succeeds, so sharing a path across the two shapes would let
-# every waiter believe it had acquired the lock.
-LOCK_TIMEOUT="${LOCK_TIMEOUT:-30}"
-
-lock_path() { printf '%s/%s.lck' "$(runtime_dir)" "$(path_key "$1" "$2")"; }
-
-# Fails closed. A false "dead" is the only verdict that can hand one lock to
-# two holders, so only an unambiguous answer counts as death: kill -0 proves
-# life outright, and otherwise ps is asked — but ps failing to *run* at all,
-# which fork pressure from several panes starting at once can cause, must not
-# be mistaken for the process being gone. kill alone is not enough either,
-# since it reports EPERM for a pid owned by another user.
-pid_alive() {
-  kill -0 "$1" 2>/dev/null && return 0
-  ps -p "$1" >/dev/null 2>&1
-  case $? in
-    0) return 0 ;;
-    1) return 1 ;;
-    *) return 0 ;;
-  esac
-}
-
-# Removing a stale lock is serialised under a guard, and the verdict is formed
-# again inside it. With the guard held the lock cannot change identity — ln
-# fails while the file exists, and no other reclaimer can be running — so the
-# file removed is the file just judged dead. Forming the verdict outside and
-# acting on it later is the race this replaces: a reclaimer whose verdict
-# predates another's full cycle would delete a live successor's lock.
-lock_reclaim() {
-  local lock="$1" guard="$2" owner holder
-  if ! mkdir "$guard" 2>/dev/null; then
-    # A reclaimer killed inside the guard would otherwise block reclaim
-    # forever. Judge it by its own pid where possible: find's granularity is
-    # whole minutes, which is well past the point every waiter has given up.
-    holder=$(cat "$guard/pid" 2>/dev/null || true)
-    if [ -n "$holder" ] && ! pid_alive "$holder"; then
-      rm -rf "$guard"
-    elif [ -z "$holder" ] &&
-      [ -n "$(find "$guard" -maxdepth 0 -mmin +1 2>/dev/null)" ]; then
-      # Killed between taking the guard and recording its pid; only age can
-      # judge this one.
-      rm -rf "$guard"
-    fi
-    return 1
-  fi
-  printf '%s' "$$" >"$guard/pid" 2>/dev/null || true
-
-  if [ -d "$lock" ]; then
-    # Not a shape this code makes; nothing can own it.
-    rm -rf "$lock"
-  elif [ ! -e "$lock" ]; then
-    # Already gone, so there is nothing to reclaim. Acting on an empty read
-    # without checking existence would delete a lock that appeared in between:
-    # while the file exists nobody can publish one, but if it was absent when
-    # read, a waiter's ln may have succeeded since.
-    :
-  else
-    owner=$(cat "$lock" 2>/dev/null || true)
-    # Publication writes the pid before linking the file into place, so a lock
-    # that exists and names nobody cannot be a live one.
-    if [ -z "$owner" ] || ! pid_alive "$owner"; then
-      rm -f "$lock"
-    fi
-  fi
-
-  # Not rmdir: the guard holds its owner's pid, so it is never empty.
-  rm -rf "$guard"
-}
-
-lock_acquire() {
-  local lock guard mine owner waited=0
-  lock="$(lock_path "$1" "$2")"
-  guard="$lock.reclaim"
-
-  mine=$(mktemp "$lock.XXXXXX") || die "cannot stage a lock beside $lock"
-  printf '%s' "$$" >"$mine"
-
-  while :; do
-    # A directory has to be dealt with before ln is attempted, because
-    # `ln file existing-directory` does not fail — it creates a file *inside*
-    # the directory and reports success, which would hand the lock to every
-    # waiter at once.
-    if [ -d "$lock" ]; then
-      lock_reclaim "$lock" "$guard" || true
-    elif ln "$mine" "$lock" 2>/dev/null; then
-      # Confirm what was published is the lock itself, holding our pid, and
-      # not a file created beneath something else that appeared in between.
-      if [ -f "$lock" ] && [ "$(cat "$lock" 2>/dev/null)" = "$$" ]; then
-        rm -f "$mine"
-        return 0
-      fi
-      rm -f "$lock/${mine##*/}" 2>/dev/null || true
-    else
-      owner=$(cat "$lock" 2>/dev/null || true)
-      if [ -z "$owner" ] || ! pid_alive "$owner"; then
-        lock_reclaim "$lock" "$guard" || true
-      fi
-    fi
-
-    if [ "$waited" -ge "$((LOCK_TIMEOUT * 20))" ]; then
-      rm -f "$mine"
-      die "timed out waiting for the lock at $lock"
-    fi
-    waited=$((waited + 1))
-    sleep 0.05
-  done
-}
-
-lock_release() { rm -f "$(lock_path "$1" "$2")"; }
-
 # ---------------------------------------------------------------------- ssh
 
 # Fills SSH_OPTS with the connection options for <host>: one multiplexed
@@ -418,27 +301,101 @@ wait_for_socket() {
   die "forwarded socket never answered: $sock"
 }
 
+# Serialises building a forward, and nothing else. The fast path — a forward
+# that is already up — never comes near it.
+#
+# A mutex is needed despite the master deduplicating identical requests,
+# because the two cases that are left pull in opposite directions.
+# StreamLocalBindUnlink has to be set, or a socket left behind by a dead
+# master blocks every later bind with EADDRINUSE and the tool never recovers.
+# But it also lets a second binder unlink a socket a third pane is already
+# using, so concurrent binds have to be kept apart.
+#
+# Deliberately the smallest thing that works: no owner recorded, no liveness
+# check, no reclaim. The critical section is a single ssh call, so a mutex
+# held far longer than that has been abandoned and is taken. Stealing costs
+# at worst one wasted bind, which the retry around it absorbs.
+forward_mutex_wait() {
+  local dir="$1" waited=0
+  while ! mkdir "$dir" 2>/dev/null; do
+    waited=$((waited + 1))
+    if [ "$waited" -gt 300 ]; then
+      rm -rf "$dir"
+      continue
+    fi
+    sleep 0.05
+  done
+}
+
 ensure_forward() {
-  local host="$1" session="$2" remote_sock="$3" sock csock
+  local host="$1" session="$2" remote_sock="$3" sock csock rcsock err
   sock=$(local_socket "$host" "$session") || exit 1
   csock=$(client_socket "$sock")
+  rcsock=$(client_socket "$remote_sock")
 
-  # Panes bridging the same session race to create the same forward. A run
-  # that dies inside this section leaves the lock behind; the next one
-  # reclaims it once the owning pid is gone.
-  lock_acquire "$host" "$session"
+  ssh_opts "$host"
+  err=$(mktemp "$(runtime_dir)/err.XXXXXX")
+
+  # No lock is taken. A multiplexing master already deduplicates an identical
+  # forward request — a second one returns success and leaves the existing
+  # listener untouched — so several panes asking for the same forward is safe.
+  #
+  # Two things still need handling, and a retry covers both. The master does
+  # not *rebind*: an identical request succeeds without recreating anything,
+  # so a socket that has gone missing cannot be repaired by asking again, and
+  # the registration has to be cancelled first. And creating the master itself
+  # is racy: panes starting together all try, the losers are refused with
+  # "forwarding request failed", and with ExitOnForwardFailure that is a hard
+  # error. A loser simply waits and looks again, by which point the winner's
+  # socket is there.
+  for _ in 1 2 3 4 5; do
+    if socket_alive "$sock"; then
+      rm -f "$err"
+      printf '%s' "$sock"
+      return 0
+    fi
+
+    forward_mutex_wait "$sock.building"
+    # Another pane may have built it while this one waited.
+    if socket_alive "$sock"; then
+      rm -rf "$sock.building"
+      rm -f "$err"
+      printf '%s' "$sock"
+      return 0
+    fi
+
+    # Only when the path is genuinely missing. Cancelling is what repairs a
+    # registration the master still believes in, but it is destructive: doing
+    # it unconditionally would take away a forward another pane had just
+    # built, and with several panes starting together that is exactly what
+    # happens.
+    if [ ! -S "$sock" ]; then
+      ssh "${SSH_OPTS[@]}" -O cancel \
+        -L "$sock:$remote_sock" -L "$csock:$rcsock" "$host" >/dev/null 2>&1 || true
+    fi
+
+    # StreamLocalBindUnlink lets ssh clear a stale path as it binds, so
+    # nothing here deletes a socket another pane may just have created.
+    if ssh "${SSH_OPTS[@]}" -o StreamLocalBindUnlink=yes \
+      -o ExitOnForwardFailure=yes -fnNT \
+      -L "$sock:$remote_sock" -L "$csock:$rcsock" "$host" 2>"$err"; then
+      rm -rf "$sock.building"
+      break
+    fi
+
+    rm -rf "$sock.building"
+    sleep 0.3
+  done
 
   if ! socket_alive "$sock"; then
-    rm -f "$sock" "$csock"
-    ssh_opts "$host"
-    ssh "${SSH_OPTS[@]}" -o ExitOnForwardFailure=yes -fnNT \
-      -L "$sock:$remote_sock" \
-      -L "$csock:$(client_socket "$remote_sock")" \
-      "$host" || die "failed to forward $host:$session sockets"
-    wait_for_socket "$sock"
+    wait_for_socket "$sock" || {
+      cat "$err" >&2
+      rm -f "$err"
+      die "failed to forward $host:$session sockets"
+    }
   fi
+  rm -f "$err"
 
-  lock_release "$host" "$session"
   printf '%s' "$sock"
 }
 
@@ -566,9 +523,15 @@ cmd_list() {
   [ -z "$TARGET_PANE" ] || die "--list takes <host>[:<session>], not a pane"
   sock=$(session_socket "$TARGET_HOST" "$TARGET_SESSION") || exit 1
   sock=$(ensure_forward "$TARGET_HOST" "$TARGET_SESSION" "$sock") || exit 1
-  agents_tsv "$sock" | awk -F'\t' '
-    BEGIN { printf "%-10s %-8s %-8s %s\n", "PANE", "AGENT", "STATE", "TITLE" }
-          { printf "%-10s %-8s %-8s %s\n", $1, $2, $3, $4 }'
+  # Collected before anything is printed: a header emitted first would turn a
+  # failed query into an empty table that looks like a session with no agents.
+  local tsv
+  tsv=$(agents_tsv "$sock") ||
+    die "cannot list agents in $TARGET_HOST:$TARGET_SESSION"
+  printf '%-10s %-8s %-8s %s\n' PANE AGENT STATE TITLE
+  [ -n "$tsv" ] || return 0
+  printf '%s\n' "$tsv" |
+    awk -F'\t' '{ printf "%-10s %-8s %-8s %s\n", $1, $2, $3, $4 }'
 }
 
 # The SSH connection is deliberately shared and outlives every bridge, so it
@@ -657,7 +620,7 @@ cmd_attach() {
 
 # --------------------------------------------------------------------- main
 
-REQUIRED_TOOLS=(ssh jq herdr awk ps)
+REQUIRED_TOOLS=(ssh jq herdr awk)
 
 require_tools() {
   local tool
@@ -703,6 +666,10 @@ main() {
         ;;
       --release)
         mode=release
+        shift
+        ;;
+      --disconnect)
+        mode=disconnect
         shift
         ;;
       --complete)

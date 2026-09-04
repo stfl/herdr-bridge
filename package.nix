@@ -1,6 +1,5 @@
 {
   lib,
-  stdenv,
   stdenvNoCC,
   makeWrapper,
   bats,
@@ -10,21 +9,16 @@
   gnugrep,
   coreutils,
   openssh,
-  procps,
   python3,
 }:
 stdenvNoCC.mkDerivation {
   pname = "herdr-bridge";
-  version = "0.0.2";
+  version = "0.0.3";
   src = ./.;
 
   # jq and gawk are needed by the suite as well as at runtime; python3 backs
   # the stub ssh's socket creation.
-  nativeBuildInputs =
-    [makeWrapper shellcheck bats python3 jq gawk]
-    # `ps` answers whether a lock's owner is still alive. The sandbox has
-    # none of its own; a real system always does, so it is not wrapped in.
-    ++ lib.optional stdenv.hostPlatform.isLinux procps;
+  nativeBuildInputs = [makeWrapper shellcheck bats python3 jq gawk];
 
   # There is nothing to compile, and the default buildPhase would otherwise
   # run the Makefile's `all` target — lint and tests, before shebangs are

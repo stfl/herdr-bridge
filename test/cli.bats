@@ -70,3 +70,33 @@ teardown() { hb_teardown; }
   [ "$status" -ne 0 ]
   [[ "$output" == *"jq is not on PATH"* ]]
 }
+
+@test "every option shown in --help is accepted by the parser" {
+  # A flag can be documented, implemented and dispatched and still be
+  # rejected, because the parser has no case for it. That is exactly how
+  # --disconnect shipped broken in 0.0.2.
+  local opt rejected=""
+  for opt in $("$HB_BIN" --help | sed -n 's/^  \(--[a-z-]*\).*/\1/p' | sort -u); do
+    run "$HB_BIN" "$opt"
+    if [[ "$output" == *"unknown option"* ]]; then
+      rejected="$rejected $opt"
+    fi
+  done
+  [ -z "$rejected" ] || {
+    echo "documented but rejected:$rejected"
+    false
+  }
+}
+
+@test "--disconnect without a host explains itself" {
+  run "$HB_BIN" --disconnect
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"--disconnect <host>"* ]]
+}
+
+@test "--disconnect closes the shared connection" {
+  run "$HB_BIN" --disconnect workbox
+  [ "$status" -eq 0 ]
+  [ -n "$(hb_calls_matching '-O exit')" ]
+  [[ "$output" == *"closed the shared connection"* ]]
+}

@@ -1,5 +1,41 @@
 # Changelog
 
+## 0.0.3
+
+- A forward whose socket went missing could not be repaired. A multiplexing
+  master answers an identical forward request with success and *without*
+  rebinding, so removing the socket and asking again left nothing behind and
+  every later run failed the same way until the connection was closed. The
+  registration is now cancelled first — but only when the path is genuinely
+  absent, because cancelling is destructive and would otherwise take away a
+  forward another pane had just built.
+- The forward lock is replaced by a mutex a fifth its size, and the `ps`
+  dependency it needed is gone. OpenSSH's master already deduplicates an
+  identical forward request, so the fast path — a forward that is already up
+  — needs no serialisation at all and no longer takes anything. Two cases
+  remain and they pull in opposite directions: `StreamLocalBindUnlink` has to
+  be set or a socket left behind by a dead master blocks every later bind and
+  the tool never recovers, but it also lets a second binder unlink a socket a
+  third pane is using. Only building a forward is therefore serialised, by a
+  bare `mkdir` with a timeout — no owner recorded, no liveness check, no
+  reclaim. The critical section is a single ssh call, so a mutex held far
+  longer than that has been abandoned and is taken; stealing costs one wasted
+  bind, which the retry absorbs. Measured at 48 of 48 concurrent cold starts
+  against a real host, where the previous arrangement managed 7 of 8 and, with
+  the unlink option off, 0 of 8.
+- `--list` printed its table header before knowing the query had succeeded, so
+  a failed listing read as a session with no agents.
+- `--disconnect` was documented in `--help`, implemented and dispatched, but
+  the argument parser had no case for it, so it was rejected as an unknown
+  option. A test now asserts that every option `--help` advertises is
+  accepted, which is the general form of that mistake.
+
+The test suite's `ssh` stub now models a multiplexing master — request
+deduplication, `-O cancel`, `-O exit` and `StreamLocalBindUnlink`. It bound a
+socket on every call before, which is precisely why the repair bug was
+invisible to a green suite and had to be found against a real host.
+
+
 ## 0.0.2
 
 Fixes from an adversarial review of 0.0.1.

@@ -1,31 +1,100 @@
 #!/usr/bin/env bash
-# Stub ssh. Two shapes are honoured:
-#   ssh [opts] <host> <command...>   -> runs the command locally
-#   ssh [opts] -L a:b [-L c:d] <host> -> creates the local socket files
+# Stub ssh. Three shapes are honoured:
+#   ssh [opts] <host> <command...>       -> runs the command locally
+#   ssh [opts] -L a:b [-L c:d] <host>    -> binds the local socket paths
+#   ssh [opts] -O cancel -L a:b <host>   -> unregisters and unbinds them
+#   ssh [opts] -O exit <host>            -> drops every registration
+#
+# It models the multiplexing master's bookkeeping, because that is where the
+# behaviour that matters lives: a master reports success for an identical
+# forward request *without rebinding*. A stub that bound the socket on every
+# call would hide a request that silently does nothing.
 set -u
 printf 'ssh %s\n' "$*" >>"${HB_CALLS:-/dev/null}"
-[ "${HB_SSH_FAIL:-0}" = 1 ] && { echo "ssh: connect failed" >&2; exit 255; }
+[ "${HB_SSH_FAIL:-0}" = 1 ] && {
+  echo "ssh: connect failed" >&2
+  exit 255
+}
 
 forwards=()
 cmd=()
 host=""
+ctl_cmd=""
+unlink_stale=0
 while [ $# -gt 0 ]; do
-  # Everything after the host is the remote command, options included.
-  if [ -n "$host" ]; then cmd+=("$1"); shift; continue; fi
+  if [ -n "$host" ]; then
+    cmd+=("$1")
+    shift
+    continue
+  fi
   case "$1" in
-    -L) forwards+=("$2"); shift 2 ;;
-    -o | -S | -i | -p | -R | -D | -F | -l) shift 2 ;;
+    -L)
+      forwards+=("$2")
+      shift 2
+      ;;
+    -O)
+      ctl_cmd="$2"
+      shift 2
+      ;;
+    -o)
+      # StreamLocalBindUnlink lets ssh clear a path left behind by a dead
+      # master as it binds. Without modelling it, a stale socket file looks
+      # unrecoverable here when the real thing recovers fine.
+      case "$2" in
+        StreamLocalBindUnlink=yes) unlink_stale=1 ;;
+      esac
+      shift 2
+      ;;
+    -S | -i | -p | -R | -D | -F | -l) shift 2 ;;
     -*) shift ;;
-    *) host="$1"; shift ;;
+    *)
+      host="$1"
+      shift
+      ;;
   esac
 done
 
+registry="${HB_MUX_DIR:-${TMPDIR:-/tmp}}/mux-${host:-none}"
+mkdir -p "$(dirname "$registry")"
+touch "$registry"
+
+registered() { grep -Fxq -- "$1" "$registry" 2>/dev/null; }
+
+unregister() {
+  grep -Fxv -- "$1" "$registry" >"$registry.tmp" 2>/dev/null || true
+  mv "$registry.tmp" "$registry"
+}
+
+case "$ctl_cmd" in
+  exit)
+    while IFS= read -r sock; do [ -n "$sock" ] && rm -f "$sock"; done <"$registry"
+    : >"$registry"
+    exit 0
+    ;;
+  cancel)
+    for f in ${forwards[@]+"${forwards[@]}"}; do
+      local_sock="${f%%:*}"
+      # Cancelling something the master never registered does nothing.
+      registered "$local_sock" || continue
+      unregister "$local_sock"
+      rm -f "$local_sock"
+    done
+    exit 0
+    ;;
+  check) exit 0 ;;
+esac
+
 for f in ${forwards[@]+"${forwards[@]}"}; do
   local_sock="${f%%:*}"
+  # An identical request on a live master is a no-op that reports success.
+  registered "$local_sock" && continue
   mkdir -p "$(dirname "$local_sock")"
+  # Nothing registered holds this path, so anything there is stale.
+  [ "$unlink_stale" = 1 ] && rm -f "$local_sock"
   python3 -c 'import socket,sys
 s = socket.socket(socket.AF_UNIX)
-s.bind(sys.argv[1])' "$local_sock"
+s.bind(sys.argv[1])' "$local_sock" || exit 255
+  printf '%s\n' "$local_sock" >>"$registry"
 done
 
 # Building the forward brings the server back, so a test can assert the

@@ -161,48 +161,10 @@ teardown() { hb_teardown; }
   [ "$status" -eq 0 ]
 }
 
-@test "flock is not required, because macOS does not ship it" {
-  run bash -c 'source "$HB_BIN"; printf "%s\n" "${REQUIRED_TOOLS[@]}"'
-  [ "$status" -eq 0 ]
-  [[ "$output" != *flock* ]]
-  [[ "$output" == *jq* ]]
-}
-
-@test "a second holder waits for the lock to be released" {
-  run bash -c 'source "$HB_BIN"
-    ensure_runtime_dir
-    lock_acquire probe p
-    ( lock_acquire probe p && echo SECOND_ENTERED ) &
-    sleep 0.4
-    echo FIRST_STILL_HOLDS
-    lock_release probe p
-    wait'
-  [ "$status" -eq 0 ]
-  [[ "$output" == *FIRST_STILL_HOLDS*SECOND_ENTERED* ]]
-}
-
-@test "a stale lock left by a dead process is broken, not waited on forever" {
-  run bash -c 'source "$HB_BIN"
-    ensure_runtime_dir
-    mkdir -p "$(lock_path stale s)"
-    echo 999999 >"$(lock_path stale s)/pid"
-    LOCK_TIMEOUT=2 lock_acquire stale s && echo ACQUIRED
-    lock_release stale s'
-  [ "$status" -eq 0 ]
-  [[ "$output" == *ACQUIRED* ]]
-}
-
 @test "a host name cannot escape the runtime directory" {
   # host and session reach path construction, and the lock is removed with
   # rm -rf, so traversal in either would be removal outside our own directory.
   run bash -c 'source "$HB_BIN"; local_socket "../../../tmp/pwn" "s"'
-  [ "$status" -eq 0 ]
-  [[ "$output" != *..* ]]
-  [[ "$output" == "$HERDR_BRIDGE_RUNTIME_DIR/"* ]]
-}
-
-@test "a session name cannot escape the lock directory" {
-  run bash -c 'source "$HB_BIN"; lock_path "h" "../../../tmp/pwn"'
   [ "$status" -eq 0 ]
   [[ "$output" != *..* ]]
   [[ "$output" == "$HERDR_BRIDGE_RUNTIME_DIR/"* ]]
@@ -215,30 +177,6 @@ teardown() { hb_teardown; }
   [[ "$(basename "$output")" != *@* ]]
 }
 
-@test "a leftover file at the lock path does not block forever" {
-  # An earlier implementation held the lock as a file. mkdir can never
-  # succeed against one, and it carries no pid to judge staleness by, so it
-  # would wedge every later run.
-  run bash -c 'source "$HB_BIN"
-    ensure_runtime_dir
-    : >"$(lock_path h s)"
-    LOCK_TIMEOUT=3 lock_acquire h s && echo ACQUIRED
-    lock_release h s'
-  [ "$status" -eq 0 ]
-  [[ "$output" == *ACQUIRED* ]]
-}
-
-@test "a lock directory with no owner recorded is reclaimed" {
-  # A holder killed between mkdir and writing its pid leaves exactly this.
-  run bash -c 'source "$HB_BIN"
-    ensure_runtime_dir
-    mkdir -p "$(lock_path h s)"
-    LOCK_TIMEOUT=5 lock_acquire h s && echo ACQUIRED
-    lock_release h s'
-  [ "$status" -eq 0 ]
-  [[ "$output" == *ACQUIRED* ]]
-}
-
 @test "path keys do not collide across different host/session splits" {
   # '-' is both a legal character and the obvious joiner, so sanitising alone
   # would give dev-box/api and dev/box-api the same socket and lock, and the
@@ -246,9 +184,9 @@ teardown() { hb_teardown; }
   # Exercised through the real entry points, because the collision is in how
   # they build the key, not in the sanitiser alone.
   run bash -c 'source "$HB_BIN"
-    a=$(local_socket "dev-box" "api");  b=$(local_socket "dev" "box-api")
-    c=$(lock_path   "dev-box" "api");  d=$(lock_path   "dev" "box-api")
-    [ "$a" != "$b" ] && [ "$c" != "$d" ] && echo DISTINCT'
+    a=$(local_socket "dev-box" "api")
+    b=$(local_socket "dev" "box-api")
+    [ "$a" != "$b" ] && echo DISTINCT'
   [ "$status" -eq 0 ]
   [[ "$output" == *DISTINCT* ]]
 }
@@ -290,180 +228,3 @@ teardown() { hb_teardown; }
   [[ "$output" == *ConnectTimeout* ]]
 }
 
-@test "contending processes never hold a reclaimed stale lock at once" {
-  # Mutual exclusion checked directly with a sentinel, rather than by reading
-  # the order of log lines, which depends on how the runner schedules them.
-  run bash -c 'source "$HB_BIN"
-    ensure_runtime_dir
-    mkdir -p "$(lock_path h s)"
-    echo 999999 >"$(lock_path h s)/pid"
-    held="$HERDR_BRIDGE_RUNTIME_DIR/held"
-    log="$HERDR_BRIDGE_RUNTIME_DIR/log"
-    : >"$log"
-    for _ in 1 2 3 4; do
-      (
-        LOCK_TIMEOUT=30 lock_acquire h s
-        if [ -e "$held" ]; then echo OVERLAP >>"$log"; fi
-        : >"$held"
-        sleep 0.05
-        rm -f "$held"
-        echo DONE >>"$log"
-        lock_release h s
-      ) &
-    done
-    wait
-    printf "overlaps=%s done=%s\n" \
-      "$(grep -c OVERLAP "$log" || true)" "$(grep -c DONE "$log" || true)"'
-  [ "$status" -eq 0 ]
-  [[ "$output" == *"overlaps=0"* ]]
-  # Every contender got the lock, so none timed out waiting on the stale one.
-  [[ "$output" == *"done=4"* ]]
-}
-
-# Replays an entry/exit log and prints the greatest number of holders that
-# were ever inside at once. Anything above 1 is a double-hold.
-hb_max_concurrent() {
-  awk '$1 == "+" { n++; if (n > m) m = n; next } { n-- } END { print m + 0 }' "$1"
-}
-
-@test "a stale lock never admits two holders, over repeated contention" {
-  export HB_BIN
-  export HB_LOG="$HERDR_BRIDGE_RUNTIME_DIR/log"
-  export HB_READY="$HERDR_BRIDGE_RUNTIME_DIR/ready"
-  : >"$HB_LOG"
-  bash -c 'source "$HB_BIN"; ensure_runtime_dir'
-
-  local round i pid
-  for round in $(seq 1 "${HB_RACE_ROUNDS:-5}"); do
-    rm -f "$HB_READY"
-    "$HB_ROOT/test/helpers/lock-victim" &
-    pid=$!
-    for i in $(seq 1 200); do
-      [ -e "$HB_READY" ] && break
-      sleep 0.01
-    done
-    kill -9 "$pid" 2>/dev/null || true
-    wait "$pid" 2>/dev/null || true
-    for i in $(seq 1 "${HB_RACE_WAITERS:-8}"); do
-      "$HB_ROOT/test/helpers/lock-waiter" &
-    done
-    wait
-  done
-
-  local max
-  max=$(hb_max_concurrent "$HB_LOG")
-  echo "max_concurrent=$max"
-  [ "$max" -eq 1 ]
-}
-
-@test "a staggered staleness verdict cannot rename a live lock away" {
-  # Deterministic: contender 1 reclaims and re-creates the lock, contender 2
-  # is still holding the verdict it formed beforehand. A verdict re-read under
-  # the reclaim guard is unaffected by any delay.
-  export HB_BIN HB_HOLD=0.5
-  export HB_LOG="$HERDR_BRIDGE_RUNTIME_DIR/log"
-  : >"$HB_LOG"
-  bash -c 'source "$HB_BIN"; ensure_runtime_dir'
-
-  export HB_READY="$HERDR_BRIDGE_RUNTIME_DIR/ready"
-  local i pid
-  rm -f "$HB_READY"
-  "$HB_ROOT/test/helpers/lock-victim" &
-  pid=$!
-  for i in $(seq 1 200); do
-    [ -e "$HB_READY" ] && break
-    sleep 0.01
-  done
-  kill -9 "$pid" 2>/dev/null || true
-  wait "$pid" 2>/dev/null || true
-
-  for i in 1 2 3; do
-    HB_DELAY=$(awk -v i="$i" 'BEGIN { printf "%.1f", (i - 1) * 0.1 }') \
-      "$HB_ROOT/test/helpers/lock-waiter" &
-  done
-  wait
-
-  local max
-  max=$(hb_max_concurrent "$HB_LOG")
-  echo "max_concurrent=$max"
-  [ "$max" -eq 1 ]
-}
-
-@test "a process is only called dead on an unambiguous answer" {
-  # A false "dead" is the only verdict that can hand one lock to two holders,
-  # and ps can fail to run at all under the fork pressure of several panes
-  # starting at once. That must read as alive.
-  run bash -c 'source "$HB_BIN"
-    kill() { return 1; }
-    ps() { return 127; }
-    if pid_alive 4000000; then echo ALIVE; else echo DEAD; fi'
-  [ "$status" -eq 0 ]
-  [ "$output" = ALIVE ]
-}
-
-@test "a process ps reports as absent is called dead" {
-  run bash -c 'source "$HB_BIN"
-    kill() { return 1; }
-    ps() { return 1; }
-    if pid_alive 4000000; then echo ALIVE; else echo DEAD; fi'
-  [ "$output" = DEAD ]
-}
-
-@test "a live process is called alive even when kill cannot signal it" {
-  # kill -0 reports EPERM for a pid owned by another user.
-  run bash -c 'source "$HB_BIN"
-    kill() { return 1; }
-    ps() { return 0; }
-    if pid_alive 1; then echo ALIVE; else echo DEAD; fi'
-  [ "$output" = ALIVE ]
-}
-
-@test "a guard left behind by a dead reclaimer is broken promptly" {
-  # Judged by the reclaimer's pid, not only by age: find's minute granularity
-  # would otherwise stall every waiter well past LOCK_TIMEOUT.
-  run bash -c 'source "$HB_BIN"
-    ensure_runtime_dir
-    lock="$(lock_path h s)"
-    mkdir -p "$lock.reclaim"
-    printf 4000000 >"$lock.reclaim/pid"
-    printf 4000000 >"$lock"
-    LOCK_TIMEOUT=5 lock_acquire h s && echo ACQUIRED
-    lock_release h s'
-  [ "$status" -eq 0 ]
-  [[ "$output" == *ACQUIRED* ]]
-}
-
-@test "reclaiming a stale lock leaves nothing behind" {
-  # The guard holds its owner's pid, so removing it with rmdir fails and the
-  # guard survives — after which no later reclaim can take it and every
-  # waiter times out instead.
-  run bash -c 'source "$HB_BIN"
-    ensure_runtime_dir
-    printf 4000000 >"$(lock_path h s)"
-    LOCK_TIMEOUT=5 lock_acquire h s
-    lock_release h s
-    ls -A "$HERDR_BRIDGE_RUNTIME_DIR"'
-  [ "$status" -eq 0 ]
-  [ -z "$output" ]
-}
-
-@test "two reclaims in a row both succeed" {
-  run bash -c 'source "$HB_BIN"
-    ensure_runtime_dir
-    for _ in 1 2; do
-      printf 4000000 >"$(lock_path h s)"
-      LOCK_TIMEOUT=5 lock_acquire h s
-      lock_release h s
-    done
-    echo BOTH'
-  [ "$status" -eq 0 ]
-  [[ "$output" == *BOTH* ]]
-}
-
-@test "ps is required, because liveness cannot be judged without it" {
-  # Liveness fails closed, so a missing ps means no stale lock is ever
-  # reclaimed and every waiter times out. Better to say so up front.
-  run bash -c 'source "$HB_BIN"; printf "%s\n" "${REQUIRED_TOOLS[@]}"'
-  [ "$status" -eq 0 ]
-  [[ "$output" == *ps* ]]
-}

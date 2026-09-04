@@ -34,6 +34,7 @@ hb_setup() {
   export HB_ATTACH_MODE=exit0
   export HB_SSH_FAIL=0
   export HB_SERVER_DOWN_FILE="$TEST_TMP/server-down"
+  export HB_MUX_DIR="$TEST_TMP/mux"
 
   hb_install_stubs
   # The completions shell out to `herdr-bridge --complete`, so the tool has to
