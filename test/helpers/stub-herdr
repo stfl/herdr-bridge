@@ -7,7 +7,11 @@ printf 'herdr %s\n' "$*" >>"${HB_CALLS:-/dev/null}"
 
 case "${1:-} ${2:-}" in
   "status server")
-    if [ -n "${HERDR_SOCKET_PATH:-}" ] && [ -S "${HERDR_SOCKET_PATH}" ]; then
+    # HB_SERVER_DOWN models the case the real binary is careless about: the
+    # socket file is present but nothing is listening. Either way this exits
+    # 0, exactly as herdr does.
+    if [ -n "${HERDR_SOCKET_PATH:-}" ] && [ -S "${HERDR_SOCKET_PATH}" ] &&
+      [ "${HB_SERVER_DOWN:-0}" != 1 ]; then
       printf 'status: running\nsocket: %s\n' "$HERDR_SOCKET_PATH"
     else
       printf 'status: not running\nsocket: %s\n' "${HERDR_SOCKET_PATH:-}"
@@ -32,8 +36,24 @@ case "${1:-} ${2:-}" in
     exit 0
     ;;
   "agent get")
-    [ -n "${HB_AGENT_GET:-}" ] && [ -f "$HB_FIXTURES/$HB_AGENT_GET" ] || exit 1
-    cat "$HB_FIXTURES/$HB_AGENT_GET"
+    # Without HERDR_SOCKET_PATH this is a query against the local session,
+    # which is how --release reads the row it is asked to clear.
+    if [ -z "${HERDR_SOCKET_PATH:-}" ]; then
+      [ -n "${HB_LOCAL_ROW:-}" ] && [ -f "$HB_LOCAL_ROW" ] || exit 1
+      cat "$HB_LOCAL_ROW"
+      exit 0
+    fi
+    # HB_AGENT_GET_FILE lets a test rewrite the answer while the bridge runs,
+    # so the mirror loop can be watched picking a change up.
+    file="${HB_AGENT_GET_FILE:-$HB_FIXTURES/${HB_AGENT_GET:-}}"
+    [ -f "$file" ] || exit 1
+    # Only the pane the fixture describes exists.
+    want=$(sed -n 's/.*"pane_id":"\([^"]*\)".*/\1/p' "$file" | head -1)
+    if [ -n "${3:-}" ] && [ -n "$want" ] && [ "$3" != "$want" ]; then
+      printf '{"error":{"code":"agent_not_found"}}\n'
+      exit 1
+    fi
+    cat "$file"
     exit 0
     ;;
   "agent attach")

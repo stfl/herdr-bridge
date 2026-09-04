@@ -57,7 +57,9 @@ _herdr_bridge_target() {
 _herdr-bridge() {
   _arguments -s -S \
     '(-h --help)'{-h,--help}'[show usage]' \
+    '(-V --version)'{-V,--version}'[print version]' \
     '--list[list sessions on a host, or agents in a session]' \
+    '--release[clear a mirrored row stuck on this pane]' \
     '--takeover[take input ownership from an existing client]' \
     '--interval[seconds between state polls]:seconds:' \
     '--ttl[ms before a mirrored sidebar row expires]:milliseconds:' \

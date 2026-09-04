@@ -238,3 +238,78 @@ teardown() { hb_teardown; }
   [ "$status" -eq 0 ]
   [[ "$output" == *ACQUIRED* ]]
 }
+
+@test "path keys do not collide across different host/session splits" {
+  # '-' is both a legal character and the obvious joiner, so sanitising alone
+  # would give dev-box/api and dev/box-api the same socket and lock, and the
+  # second bridge would silently drive the first one's server.
+  # Exercised through the real entry points, because the collision is in how
+  # they build the key, not in the sanitiser alone.
+  run bash -c 'source "$HB_BIN"
+    a=$(local_socket "dev-box" "api");  b=$(local_socket "dev" "box-api")
+    c=$(lock_path   "dev-box" "api");  d=$(lock_path   "dev" "box-api")
+    [ "$a" != "$b" ] && [ "$c" != "$d" ] && echo DISTINCT'
+  [ "$status" -eq 0 ]
+  [[ "$output" == *DISTINCT* ]]
+}
+
+@test "path keys do not collide after character substitution" {
+  # Two different ssh targets must not share a ControlPath either.
+  run bash -c 'source "$HB_BIN"
+    ssh_opts "user@host"; a="${SSH_OPTS[*]}"
+    ssh_opts "user_host"; b="${SSH_OPTS[*]}"
+    [ "$a" != "$b" ] && echo DISTINCT'
+  [ "$status" -eq 0 ]
+  [[ "$output" == *DISTINCT* ]]
+}
+
+@test "socket paths still fit once the key carries a checksum" {
+  run bash -c 'source "$HB_BIN"; local_socket "some-longish-host.example.com" "session"'
+  [ "$status" -eq 0 ]
+  [ "${#output}" -lt 96 ]
+}
+
+@test "is_positive_number rejects a second decimal point" {
+  run bash -c 'source "$HB_BIN"; is_positive_number "1.2.3"'
+  [ "$status" -ne 0 ]
+}
+
+@test "--ttl requires whole milliseconds" {
+  run "$HB_BIN" --ttl 1.5 workbox:api
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"--ttl"* ]]
+}
+
+@test "ssh is given keepalives and a connect timeout" {
+  # Without them a suspended laptop leaves calls hanging on a dead master
+  # while the forward lock is held, which takes sibling panes down with it.
+  run bash -c 'source "$HB_BIN"; ssh_opts host; printf "%s\n" "${SSH_OPTS[@]}"'
+  [ "$status" -eq 0 ]
+  [[ "$output" == *ServerAliveInterval* ]]
+  [[ "$output" == *ServerAliveCountMax* ]]
+  [[ "$output" == *ConnectTimeout* ]]
+}
+
+@test "contending processes never hold a reclaimed stale lock at once" {
+  run bash -c 'source "$HB_BIN"
+    ensure_runtime_dir
+    mkdir -p "$(lock_path h s)"
+    echo 999999 >"$(lock_path h s)/pid"
+    log="$HERDR_BRIDGE_RUNTIME_DIR/order"
+    : >"$log"
+    for _ in 1 2 3 4 5 6; do
+      (
+        LOCK_TIMEOUT=25 lock_acquire h s
+        echo IN >>"$log"
+        sleep 0.05
+        echo OUT >>"$log"
+        lock_release h s
+      ) &
+    done
+    wait
+    awk "{ if (\$0 == prev) { print \"OVERLAP\"; exit 1 } prev = \$0 }
+         END { print \"ALTERNATING\" }" "$log"'
+  [ "$status" -eq 0 ]
+  [[ "$output" == *ALTERNATING* ]]
+  [[ "$output" != *OVERLAP* ]]
+}

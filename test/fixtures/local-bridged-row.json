@@ -1,0 +1,4 @@
+{"id":"cli:agent:get","result":{"type":"agent_info","agent":
+ {"agent":"claude","agent_status":"working","pane_id":"w1:p2",
+  "display_agent":"claude@workbox","title":"auth middleware",
+  "tokens":{"host":"workbox","session":"api"}}}}

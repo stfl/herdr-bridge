@@ -29,3 +29,41 @@ jobs:
 
       - name: Test
         run: make test
+
+      # macOS ships bash 3.2 as /bin/bash, but Homebrew's bash leads the
+      # runner's PATH, so the suite above does not exercise it. These do.
+      - name: Report which bash is in play (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          echo "PATH bash:   $(command -v bash) — $(bash --version | head -1)"
+          echo "system bash: /bin/bash — $(/bin/bash --version | head -1)"
+
+      - name: Syntax check under the system bash (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          /bin/bash -n bin/herdr-bridge
+          /bin/bash -n completions/herdr-bridge.bash
+          /bin/bash -n test/helpers/stub-herdr
+          /bin/bash -n test/helpers/stub-ssh
+
+      - name: Test under the system bash (macOS)
+        if: runner.os == 'macOS'
+        # `env bash` in the shebang then resolves to /bin/bash.
+        run: PATH="/bin:$PATH" bats test
+
+      - name: Verify install works (no GNU coreutils assumed)
+        run: |
+          make install DESTDIR="$PWD/_install" PREFIX=/usr/local
+          test -x "$PWD/_install/usr/local/bin/herdr-bridge"
+          test -f "$PWD/_install/usr/local/share/zsh/site-functions/_herdr-bridge"
+
+  nix:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: cachix/install-nix-action@v27
+        with:
+          extra_nix_config: "experimental-features = nix-command flakes"
+      # Runs shellcheck and the suite hermetically, so package.nix cannot rot
+      # unnoticed behind the Makefile path.
+      - run: nix flake check --print-build-logs

@@ -9,17 +9,16 @@
   gnugrep,
   coreutils,
   openssh,
-  util-linux,
   python3,
 }:
 stdenvNoCC.mkDerivation {
   pname = "herdr-bridge";
-  version = "0.0.1";
+  version = "0.0.2";
   src = ./.;
 
-  # jq, gawk and util-linux (flock) are needed by the suite as well as at
-  # runtime; python3 backs the stub ssh's socket creation.
-  nativeBuildInputs = [makeWrapper shellcheck bats python3 jq gawk util-linux];
+  # jq and gawk are needed by the suite as well as at runtime; python3 backs
+  # the stub ssh's socket creation.
+  nativeBuildInputs = [makeWrapper shellcheck bats python3 jq gawk];
 
   # There is nothing to compile, and the default buildPhase would otherwise
   # run the Makefile's `all` target — lint and tests, before shebangs are
@@ -50,7 +49,7 @@ stdenvNoCC.mkDerivation {
     # whichever herdr owns the session it runs inside, not to a copy pinned
     # here. Everything else it shells out to is pinned.
     wrapProgram "$out/bin/herdr-bridge" \
-      --prefix PATH : ${lib.makeBinPath [jq gawk gnugrep coreutils openssh util-linux]}
+      --prefix PATH : ${lib.makeBinPath [jq gawk gnugrep coreutils openssh]}
     runHook postInstall
   '';
 

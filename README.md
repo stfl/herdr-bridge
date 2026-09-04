@@ -74,8 +74,8 @@ sudo make install            # PREFIX=/usr/local by default
 
 `make install` also installs zsh and bash completions.
 
-**Requirements:** `herdr`, `ssh`, `jq`, `flock` (util-linux), `awk`. The tool
-checks for each and names the missing one. `herdr` is deliberately taken from
+**Requirements:** `herdr`, `ssh`, `jq`, `awk`. The tool checks for each and
+names the missing one. `herdr` is deliberately taken from
 `PATH` rather than pinned, because it has to speak to whichever herdr owns
 your session.
 
@@ -109,9 +109,20 @@ Forwarded sockets and locks live in `$XDG_RUNTIME_DIR/herdr-bridge`, or in
 which is the case on macOS, where the per-user temp directory is already most
 of the 108-byte budget. `HERDR_BRIDGE_RUNTIME_DIR` overrides both.
 
-Detach the same way you would from any attach, or press `ctrl-c`; the row is
-withdrawn from the sidebar as you leave. A hard kill can strand a row, and
+The bridge ends when the attach does — when the remote agent exits, or when
+you close the local pane — and the row is withdrawn from the sidebar on the
+way out.
+
+Two things about keys, because the pane is shared. The attach holds the
+terminal in raw mode, so `ctrl-c` reaches the remote agent rather than
+interrupting the bridge. And the local herdr client owns the prefix, so the
+attach's own `ctrl+b q` detach is not reachable from inside a local pane;
+close the pane instead. A hard kill can strand a row, and
 `herdr-bridge --release` clears it from the pane it is stuck on.
+
+The SSH forward outlives the bridge on purpose, so several panes and repeated
+runs share one connection. `ssh -O exit <host>` closes it, and the multiplexed
+master expires on its own after two idle minutes.
 
 ### Showing the host in the sidebar
 
@@ -143,8 +154,8 @@ rows = [
 
 Unifying several herdr servers in one sidebar is
 [discussion #515](https://github.com/herdrdev/herdr/discussions/515) upstream,
-where the maintainer has called it the top priority and said he intends to
-build it on herdr's reworked client-server architecture himself. Treat this
+where the maintainer has called it the top priority and intends to build it
+on herdr's reworked client-server architecture themselves. Treat this
 tool as something to use until that lands, not as a bid to pre-empt it.
 
 [herdr-mirror](https://github.com/nikok6/herdr-mirror) already does more than

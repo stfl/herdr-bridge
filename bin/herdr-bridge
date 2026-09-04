@@ -30,7 +30,7 @@
 set -euo pipefail
 
 readonly PROG="herdr-bridge"
-readonly VERSION="0.0.1"
+readonly VERSION="0.0.2"
 
 # Defaults, overridable per run.
 interval=1
@@ -78,9 +78,11 @@ environment:
                             a unix socket path
 
 Run it from inside a herdr pane; that pane is the one the remote agent takes
-over. The mirrored row is released when this exits, including on ctrl-c and on
-a detach from the remote pane. A hard kill (SIGKILL) can leave the row behind;
-"$PROG --release" clears it from the pane it is stuck on.
+over. The bridge ends when the attach does, and the mirrored row is released
+on the way out. The attach holds the terminal in raw mode, so ctrl-c reaches
+the remote agent rather than this; close the pane to end the bridge. A hard
+kill (SIGKILL) can leave the row behind; "$PROG --release" clears it from
+the pane it is stuck on.
 EOF
 }
 
@@ -134,7 +136,17 @@ client_socket() { printf '%s-client.sock' "${1%.sock}"; }
 # which may turn into path structure. Runs of dots collapse too, so no part of
 # the name can climb out of the runtime directory.
 path_key() {
-  printf '%s' "$*" | tr -c 'A-Za-z0-9._-' '_' | sed 's/\.\{2,\}/_/g'
+  local stem sum
+  stem=$(printf '%s-' "$@" |
+    tr -c 'A-Za-z0-9._-' '_' |
+    sed 's/\.\{2,\}/_/g; s/-$//')
+  # Sanitising alone would collide: '-' is both a legal character and the
+  # obvious joiner, so host dev-box + session api and host dev + session
+  # box-api would share a socket and a lock, and '@' and '_' both fold to '_'.
+  # A checksum over the exact inputs, NUL-separated, keeps distinct inputs
+  # distinct while the readable stem stays readable.
+  sum=$(printf '%s\0' "$@" | cksum | cut -d' ' -f1)
+  printf '%s-%s' "$stem" "$sum"
 }
 
 # Sockets live under this directory, so it has to be short: sun_path caps a
@@ -173,7 +185,7 @@ ensure_runtime_dir() {
 # decides whether the names fit.
 local_socket() {
   local host="$1" session="$2" sock
-  sock="$(runtime_dir)/$(path_key "$host-$session").sock"
+  sock="$(runtime_dir)/$(path_key "$host" "$session").sock"
   [ "${#sock}" -lt 96 ] ||
     die "socket path too long for a unix socket: $(client_socket "$sock")"
   printf '%s' "$sock"
@@ -201,12 +213,21 @@ now_ms() {
 # in between.
 LOCK_TIMEOUT="${LOCK_TIMEOUT:-10}"
 
-lock_path() { printf '%s/%s.lock' "$(runtime_dir)" "$(path_key "$1-$2")"; }
+lock_path() { printf '%s/%s.lock' "$(runtime_dir)" "$(path_key "$1" "$2")"; }
 
 lock_acquire() {
-  local dir owner waited=0
+  local dir owner waited=0 lost=0
   dir="$(lock_path "$1" "$2")"
-  while ! mkdir "$dir" 2>/dev/null; do
+  while :; do
+    if mkdir "$dir" 2>/dev/null; then
+      # A directory removed from under us between mkdir and this write means
+      # the lock is not ours; start over rather than believe we hold it.
+      if printf '%s' "$$" >"$dir/pid" 2>/dev/null; then return 0; fi
+      lost=$((lost + 1))
+      [ "$lost" -lt 10 ] || die "could not take the lock at $dir"
+      continue
+    fi
+
     # Anything that is not a directory here was never a lock this code took,
     # and carries no owner to judge staleness by. It would block every later
     # run forever, so it goes.
@@ -214,27 +235,28 @@ lock_acquire() {
       rm -f "$dir"
       continue
     fi
-    # A lock whose owner died would otherwise block every later run too. The
-    # runtime directory is private to one user, so every holder is ours to
-    # signal.
+
     owner=$(cat "$dir/pid" 2>/dev/null || true)
-    if [ -n "$owner" ] && ! kill -0 "$owner" 2>/dev/null; then
-      rm -rf "$dir"
-      continue
+    # A lock whose owner died, or one whose owner was never recorded because
+    # the holder was killed mid-acquire, is reclaimed by renaming it away
+    # first: whoever wins the rename owns the cleanup, so a waiter that has
+    # already re-created the lock cannot have it deleted underneath.
+    if { [ -n "$owner" ] && ! kill -0 "$owner" 2>/dev/null; } ||
+      { [ -z "$owner" ] && [ "$waited" -gt 20 ]; }; then
+      if mv "$dir" "$dir.$$.stale" 2>/dev/null; then
+        rm -rf "$dir.$$.stale"
+        continue
+      fi
+      # Losing the rename means another waiter is reclaiming it; fall through
+      # to the wait rather than spinning on a directory that is already gone.
     fi
-    # A holder killed between mkdir and recording its pid leaves a directory
-    # nothing can ever judge. Give it a grace period, then reclaim it.
-    if [ -z "$owner" ] && [ "$waited" -gt 20 ]; then
-      rm -rf "$dir"
-      continue
-    fi
+
     if [ "$waited" -ge "$((LOCK_TIMEOUT * 20))" ]; then
       die "timed out waiting for the lock at $dir"
     fi
     waited=$((waited + 1))
     sleep 0.05
   done
-  printf '%s' "$$" >"$dir/pid"
 }
 
 lock_release() { rm -rf "$(lock_path "$1" "$2")"; }
@@ -251,7 +273,14 @@ lock_release() { rm -rf "$(lock_path "$1" "$2")"; }
 ssh_opts() {
   SSH_OPTS=(-o ControlMaster=auto
     -o "ControlPath=$(runtime_dir)/ssh-$(path_key "$1").ctl"
-    -o ControlPersist=120)
+    -o ControlPersist=120
+    # Without these a suspended laptop or a changed network leaves calls
+    # hanging on a master that notices nothing for as long as TCP takes to
+    # give up — and ensure_forward holds the lock while it waits, which takes
+    # sibling panes down with it.
+    -o ServerAliveInterval=15
+    -o ServerAliveCountMax=3
+    -o ConnectTimeout=10)
   if [ "${BATCH:-0}" = 1 ]; then
     SSH_OPTS+=(-o BatchMode=yes)
   fi
@@ -401,7 +430,7 @@ cleanup() {
   # release carries a sequence number well ahead of any of them.
   if [ -n "${lpane:-}" ] && [ -n "${source_id:-}" ] && [ -n "${agent:-}" ]; then
     herdr pane release-agent "$lpane" --source "$source_id" --agent "$agent" \
-      --seq "$(($(now_ms) + 60000))" >/dev/null 2>&1 || true
+      --seq "$(($(now_ms) + 2000))" >/dev/null 2>&1 || true
   fi
 }
 
@@ -489,7 +518,7 @@ cmd_release() {
   { [ -n "$host" ] && [ -n "$session" ]; } ||
     die "$lpane does not carry a bridged agent"
   herdr pane release-agent "$lpane" --source "$PROG:$host:$session" \
-    --agent "$agent" --seq "$(($(now_ms) + 60000))"
+    --agent "$agent" --seq "$(($(now_ms) + 2000))"
   printf '%s: released %s@%s from %s\n' "$PROG" "$agent" "$host" "$lpane"
 }
 
@@ -561,8 +590,17 @@ require_tools() {
 
 is_positive_number() {
   case "${1-}" in
-    '' | *[!0-9.]* | '.') return 1 ;;
+    '' | *[!0-9.]* | '.' | *.*.*) return 1 ;;
     *) awk -v v="$1" 'BEGIN { exit !(v + 0 > 0) }' ;;
+  esac
+}
+
+# herdr takes --ttl-ms as whole milliseconds; a fractional value is rejected
+# there, and the rejection is swallowed, so it is caught here instead.
+is_positive_integer() {
+  case "${1-}" in
+    '' | *[!0-9]*) return 1 ;;
+    *) [ "$1" -gt 0 ] 2>/dev/null ;;
   esac
 }
 
@@ -604,8 +642,8 @@ main() {
         ;;
       --ttl)
         ttl_ms="${2:-}"
-        is_positive_number "$ttl_ms" ||
-          die "--ttl expects a positive number of milliseconds"
+        is_positive_integer "$ttl_ms" ||
+          die "--ttl expects a whole positive number of milliseconds"
         shift 2
         ;;
       --)

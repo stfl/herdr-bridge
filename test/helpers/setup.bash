@@ -7,6 +7,13 @@ HB_BIN="$HB_ROOT/bin/herdr-bridge"
 export HB_ROOT HB_BIN
 
 hb_setup() {
+  # The suite is usually run from inside a herdr pane, which exports these.
+  # Inheriting them makes a local run differ from CI, where they are absent —
+  # HERDR_SOCKET_PATH in particular decides whether a `herdr` call is treated
+  # as local or remote.
+  unset HERDR_SOCKET_PATH HERDR_ENV HERDR_PANE_ID HERDR_TAB_ID \
+    HERDR_WORKSPACE_ID HERDR_BIN_PATH HERDR_CONFIG_PATH
+
   TEST_TMP="$(mktemp -d)"
   export TEST_TMP
   export XDG_RUNTIME_DIR="$TEST_TMP/run"
@@ -28,6 +35,9 @@ hb_setup() {
   export HB_SSH_FAIL=0
 
   hb_install_stubs
+  # The completions shell out to `herdr-bridge --complete`, so the tool has to
+  # be reachable by name for them to be testable at all.
+  ln -sf "$HB_BIN" "$TEST_TMP/bin/herdr-bridge"
   PATH="$TEST_TMP/bin:$PATH"
   export PATH
   export HOME="$TEST_TMP/home"

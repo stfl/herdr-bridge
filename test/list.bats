@@ -13,11 +13,17 @@ teardown() { hb_teardown; }
 }
 
 @test "--list <host:session> forwards both sockets" {
+  local sock csock
+  sock=$(bash -c 'source "$HB_BIN"; local_socket workbox api')
+  csock=$(bash -c "source \"\$HB_BIN\"; client_socket '$sock'")
+
   run "$HB_BIN" --list workbox:api
   [ "$status" -eq 0 ]
-  # Both halves of herdr's socket pair, with its own naming preserved.
-  [ -n "$(hb_calls_matching 'workbox-api.sock:/home/u/.config/herdr/sessions/api/herdr.sock')" ]
-  [ -n "$(hb_calls_matching 'workbox-api-client.sock:/home/u/.config/herdr/sessions/api/herdr-client.sock')" ]
+  # Both halves of herdr's pair, each mapped to its remote counterpart, with
+  # herdr's own X.sock / X-client.sock spelling preserved on the local side —
+  # the streaming commands derive the second name from the first.
+  [ -n "$(hb_calls_matching "$sock:/home/u/.config/herdr/sessions/api/herdr.sock")" ]
+  [ -n "$(hb_calls_matching "$csock:/home/u/.config/herdr/sessions/api/herdr-client.sock")" ]
 }
 
 @test "--list <host:session> prints a table of agents" {

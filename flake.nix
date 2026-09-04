@@ -24,7 +24,7 @@
 
     devShells = forAllSystems (pkgs: {
       default = pkgs.mkShell {
-        packages = with pkgs; [bats shellcheck shfmt jq openssh util-linux];
+        packages = with pkgs; [bats shellcheck shfmt jq openssh zsh];
       };
     });
 
