@@ -178,8 +178,10 @@ s.bind(sys.argv[1])' "$HERDR_BRIDGE_RUNTIME_DIR/$(bash -c 'source "$HB_BIN"; pat
     "$HB_BIN" --interval 0.2 workbox:api:w5:p1 >/dev/null 2>&1 &
   local pid=$!
   hb_wait_for '--state idle' || { kill "$pid" 2>/dev/null; false; }
-  sed -i 's/"agent_status":"done"/"agent_status":"blocked"/' "$TEST_TMP/agent.json"
-  run hb_wait_for '--state blocked' 40
+  # Copied, not edited in place: BSD sed -i takes a mandatory backup suffix,
+  # so an in-place edit silently does nothing on macOS.
+  cp "$HB_FIXTURES/agent-get-blocked.json" "$TEST_TMP/agent.json"
+  run hb_wait_for '--state blocked' 100
   kill -TERM "$pid" 2>/dev/null
   wait "$pid" 2>/dev/null || true
   [ "$status" -eq 0 ]

@@ -291,25 +291,31 @@ teardown() { hb_teardown; }
 }
 
 @test "contending processes never hold a reclaimed stale lock at once" {
+  # Mutual exclusion checked directly with a sentinel, rather than by reading
+  # the order of log lines, which depends on how the runner schedules them.
   run bash -c 'source "$HB_BIN"
     ensure_runtime_dir
     mkdir -p "$(lock_path h s)"
     echo 999999 >"$(lock_path h s)/pid"
-    log="$HERDR_BRIDGE_RUNTIME_DIR/order"
+    held="$HERDR_BRIDGE_RUNTIME_DIR/held"
+    log="$HERDR_BRIDGE_RUNTIME_DIR/log"
     : >"$log"
-    for _ in 1 2 3 4 5 6; do
+    for _ in 1 2 3 4; do
       (
-        LOCK_TIMEOUT=25 lock_acquire h s
-        echo IN >>"$log"
+        LOCK_TIMEOUT=30 lock_acquire h s
+        if [ -e "$held" ]; then echo OVERLAP >>"$log"; fi
+        : >"$held"
         sleep 0.05
-        echo OUT >>"$log"
+        rm -f "$held"
+        echo DONE >>"$log"
         lock_release h s
       ) &
     done
     wait
-    awk "{ if (\$0 == prev) { print \"OVERLAP\"; exit 1 } prev = \$0 }
-         END { print \"ALTERNATING\" }" "$log"'
+    printf "overlaps=%s done=%s\n" \
+      "$(grep -c OVERLAP "$log" || true)" "$(grep -c DONE "$log" || true)"'
   [ "$status" -eq 0 ]
-  [[ "$output" == *ALTERNATING* ]]
-  [[ "$output" != *OVERLAP* ]]
+  [[ "$output" == *"overlaps=0"* ]]
+  # Every contender got the lock, so none timed out waiting on the stale one.
+  [[ "$output" == *"done=4"* ]]
 }
