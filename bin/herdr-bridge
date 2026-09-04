@@ -71,7 +71,11 @@ options:
   -h, --help    this text
 
 environment:
-  HERDR_BRIDGE_HOSTS  space-separated hosts offered first by completion
+  HERDR_BRIDGE_HOSTS        space-separated hosts offered first by completion
+  HERDR_BRIDGE_RUNTIME_DIR  where forwarded sockets and locks live; defaults
+                            to \$XDG_RUNTIME_DIR/herdr-bridge, or
+                            /tmp/herdr-bridge-\$uid when that is too long for
+                            a unix socket path
 
 Run it from inside a herdr pane; that pane is the one the remote agent takes
 over. The mirrored row is released when this exits, including on ctrl-c and on
@@ -130,6 +134,10 @@ client_socket() { printf '%s-client.sock' "${1%.sock}"; }
 # A long XDG_RUNTIME_DIR is therefore traded for a short, user-owned path.
 runtime_dir() {
   local base dir
+  if [ -n "${HERDR_BRIDGE_RUNTIME_DIR:-}" ]; then
+    printf '%s' "$HERDR_BRIDGE_RUNTIME_DIR"
+    return 0
+  fi
   base="${XDG_RUNTIME_DIR:-}"
   if [ -n "$base" ]; then
     dir="$base/herdr-bridge"

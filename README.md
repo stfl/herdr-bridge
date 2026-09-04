@@ -104,6 +104,11 @@ w5:p1  -- claude · working · refactor the auth middleware
 Hosts come from `HERDR_BRIDGE_HOSTS` (space separated) and from your
 `~/.ssh/config`, minus the local machine.
 
+Forwarded sockets and locks live in `$XDG_RUNTIME_DIR/herdr-bridge`, or in
+`/tmp/herdr-bridge-$uid` when that path is too long to hold a unix socket —
+which is the case on macOS, where the per-user temp directory is already most
+of the 108-byte budget. `HERDR_BRIDGE_RUNTIME_DIR` overrides both.
+
 Detach the same way you would from any attach, or press `ctrl-c`; the row is
 withdrawn from the sidebar as you leave. A hard kill can strand a row, and
 `herdr-bridge --release` clears it from the pane it is stuck on.

@@ -24,8 +24,10 @@ case "${1:-} ${2:-}" in
     exit 0
     ;;
   "agent list")
-    [ -n "${HERDR_SOCKET_PATH:-}" ] && [ -S "${HERDR_SOCKET_PATH}" ] || {
-      printf '{"error":{"code":"server_not_running"}}\n'; exit 1; }
+    if [ -z "${HERDR_SOCKET_PATH:-}" ] || [ ! -S "${HERDR_SOCKET_PATH}" ]; then
+      printf '{"error":{"code":"server_not_running"}}\n'
+      exit 1
+    fi
     cat "$HB_FIXTURES/$HB_AGENTS"
     exit 0
     ;;

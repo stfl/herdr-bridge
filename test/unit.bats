@@ -98,15 +98,18 @@ teardown() { hb_teardown; }
   # enough that a socket beneath it exceeds sun_path.
   long="$TEST_TMP/$(printf 'deep/%.0s' $(seq 1 20))"
   mkdir -p "$long"
-  run env XDG_RUNTIME_DIR="$long" bash -c 'source "$HB_BIN"; local_socket workbox api'
+  run env -u HERDR_BRIDGE_RUNTIME_DIR XDG_RUNTIME_DIR="$long" \
+    bash -c 'source "$HB_BIN"; local_socket workbox api'
   [ "$status" -eq 0 ]
   [ "${#output}" -lt 96 ]
 }
 
 @test "a symlinked runtime directory is refused rather than followed" {
-  mkdir -p "$TEST_TMP/rt"
-  ln -s /tmp "$TEST_TMP/rt/herdr-bridge"
-  run env XDG_RUNTIME_DIR="$TEST_TMP/rt" bash -c \
+  # Addressed directly, because a deep XDG_RUNTIME_DIR — which is what macOS
+  # gives a test — would be traded for the short fallback and never looked at.
+  local link="$TEST_TMP/rt-link"
+  ln -s /tmp "$link"
+  run env HERDR_BRIDGE_RUNTIME_DIR="$link" bash -c \
     'source "$HB_BIN"; ensure_runtime_dir'
   [ "$status" -ne 0 ]
   [[ "$output" == *"owned by this user"* ]]

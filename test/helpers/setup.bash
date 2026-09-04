@@ -13,6 +13,10 @@ hb_setup() {
   export HB_CALLS="$TEST_TMP/calls.log"
   export HB_FIXTURES="$HB_ROOT/test/fixtures"
   export HB_STATE_DIR="$TEST_TMP/state"
+  # Short and unique per test: the tool's own /tmp fallback is shared by every
+  # run on the machine, which would leak forwards between tests.
+  HERDR_BRIDGE_RUNTIME_DIR="$(mktemp -d /tmp/hb-XXXXXX)"
+  export HERDR_BRIDGE_RUNTIME_DIR
   mkdir -p "$XDG_RUNTIME_DIR" "$HB_STATE_DIR"
   : >"$HB_CALLS"
 
@@ -32,6 +36,7 @@ hb_setup() {
 
 hb_teardown() {
   [ -n "${TEST_TMP:-}" ] && rm -rf "$TEST_TMP"
+  [ -n "${HERDR_BRIDGE_RUNTIME_DIR:-}" ] && rm -rf "$HERDR_BRIDGE_RUNTIME_DIR"
   return 0
 }
 
