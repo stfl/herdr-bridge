@@ -30,7 +30,7 @@
 set -euo pipefail
 
 readonly PROG="herdr-bridge"
-readonly VERSION="0.0.3"
+readonly VERSION="0.0.4"
 
 # Defaults, overridable per run.
 interval=1
@@ -292,13 +292,16 @@ socket_alive() {
     grep -q '^status: running'
 }
 
+# Reports failure rather than exiting, so the caller can print what ssh
+# actually said first. Key, agent and host-key problems all end up here, and
+# ssh's own line is the only one that says which.
 wait_for_socket() {
   local sock="$1" _
   for _ in $(seq 1 50); do
     if socket_alive "$sock"; then return 0; fi
     sleep 0.1
   done
-  die "forwarded socket never answered: $sock"
+  return 1
 }
 
 # Serialises building a forward, and nothing else. The fast path — a forward
@@ -389,9 +392,9 @@ ensure_forward() {
 
   if ! socket_alive "$sock"; then
     wait_for_socket "$sock" || {
-      cat "$err" >&2
+      [ -s "$err" ] && cat "$err" >&2
       rm -f "$err"
-      die "failed to forward $host:$session sockets"
+      die "the forwarded socket for $host:$session never answered"
     }
   fi
   rm -f "$err"

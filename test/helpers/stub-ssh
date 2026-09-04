@@ -88,6 +88,10 @@ for f in ${forwards[@]+"${forwards[@]}"}; do
   local_sock="${f%%:*}"
   # An identical request on a live master is a no-op that reports success.
   registered "$local_sock" && continue
+  if [ "${HB_SSH_BIND_FAIL:-0}" = 1 ]; then
+    echo "FAKE_BIND_ERROR: cannot bind $local_sock" >&2
+    exit 255
+  fi
   mkdir -p "$(dirname "$local_sock")"
   # Nothing registered holds this path, so anything there is stale.
   [ "$unlink_stale" = 1 ] && rm -f "$local_sock"

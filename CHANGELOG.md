@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.0.4
+
+- A failed forward reported only that the socket never answered, and threw
+  away the line that said why. `wait_for_socket` exited on its own, which made
+  the caller's error branch unreachable, so ssh's own diagnostic was never
+  printed and a scratch file was left behind on every failed run. Key, agent
+  and host-key problems all surface here, and they are the most common real
+  failure.
+
+
 ## 0.0.3
 
 - A forward whose socket went missing could not be repaired. A multiplexing

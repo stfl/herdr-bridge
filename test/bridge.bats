@@ -301,3 +301,20 @@ s.bind(sys.argv[1])' "$HERDR_BRIDGE_RUNTIME_DIR/$(bash -c 'source "$HB_BIN"; pat
   [ "$status" -eq 0 ]
   [ ! -e "$sock.building" ]
 }
+
+@test "an ssh failure to bind reports ssh's own diagnostic" {
+  # Key, agent and host-key problems all surface here, and they are the most
+  # common real failure. Reporting only "socket never answered" hides the one
+  # line that says what went wrong.
+  export HB_SSH_BIND_FAIL=1
+  run "$HB_BIN" --list workbox:api
+  [ "$status" -ne 0 ]
+  [[ "$output" == *FAKE_BIND_ERROR* ]]
+}
+
+@test "a failed forward leaves no error scratch file behind" {
+  export HB_SSH_BIND_FAIL=1
+  run "$HB_BIN" --list workbox:api
+  run bash -c "ls '$HERDR_BRIDGE_RUNTIME_DIR'/err.* 2>/dev/null | wc -l"
+  [ "$output" = "0" ]
+}

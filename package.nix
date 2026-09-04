@@ -13,7 +13,7 @@
 }:
 stdenvNoCC.mkDerivation {
   pname = "herdr-bridge";
-  version = "0.0.3";
+  version = "0.0.4";
   src = ./.;
 
   # jq and gawk are needed by the suite as well as at runtime; python3 backs
