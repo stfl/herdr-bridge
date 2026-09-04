@@ -128,6 +128,15 @@ map_state() {
 # name, so a forwarded pair has to keep herdr's own spelling.
 client_socket() { printf '%s-client.sock' "${1%.sock}"; }
 
+# A file-name-safe stem for a host and session. Both are user input that ends
+# up in socket paths, in an SSH ControlPath, and in a lock directory that is
+# removed with rm -rf; an ssh target may legitimately carry @, : or /, none of
+# which may turn into path structure. Runs of dots collapse too, so no part of
+# the name can climb out of the runtime directory.
+path_key() {
+  printf '%s' "$*" | tr -c 'A-Za-z0-9._-' '_' | sed 's/\.\{2,\}/_/g'
+}
+
 # Sockets live under this directory, so it has to be short: sun_path caps a
 # unix socket path at 108 bytes, and macOS's per-user temp directory
 # (/var/folders/<hash>/<hash>/T) spends most of that before a filename exists.
@@ -164,7 +173,7 @@ ensure_runtime_dir() {
 # decides whether the names fit.
 local_socket() {
   local host="$1" session="$2" sock
-  sock="$(runtime_dir)/$host-$session.sock"
+  sock="$(runtime_dir)/$(path_key "$host-$session").sock"
   [ "${#sock}" -lt 96 ] ||
     die "socket path too long for a unix socket: $(client_socket "$sock")"
   printf '%s' "$sock"
@@ -192,9 +201,11 @@ now_ms() {
 # in between.
 LOCK_TIMEOUT="${LOCK_TIMEOUT:-10}"
 
+lock_path() { printf '%s/%s.lock' "$(runtime_dir)" "$(path_key "$1-$2")"; }
+
 lock_acquire() {
-  local name="$1" dir owner waited=0
-  dir="$(runtime_dir)/$name.lock"
+  local dir owner waited=0
+  dir="$(lock_path "$1" "$2")"
   while ! mkdir "$dir" 2>/dev/null; do
     # A lock whose owner died would otherwise block every later run. The
     # runtime directory is private to one user, so every holder is ours to
@@ -205,7 +216,7 @@ lock_acquire() {
       continue
     fi
     if [ "$waited" -ge "$((LOCK_TIMEOUT * 20))" ]; then
-      die "timed out waiting for the $name lock"
+      die "timed out waiting for the lock at $dir"
     fi
     waited=$((waited + 1))
     sleep 0.05
@@ -213,7 +224,7 @@ lock_acquire() {
   printf '%s' "$$" >"$dir/pid"
 }
 
-lock_release() { rm -rf "$(runtime_dir)/$1.lock"; }
+lock_release() { rm -rf "$(lock_path "$1" "$2")"; }
 
 # ---------------------------------------------------------------------- ssh
 
@@ -226,7 +237,7 @@ lock_release() { rm -rf "$(runtime_dir)/$1.lock"; }
 # 3.2 — still the system shell on macOS — does not have.
 ssh_opts() {
   SSH_OPTS=(-o ControlMaster=auto
-    -o "ControlPath=$(runtime_dir)/ssh-$1.ctl"
+    -o "ControlPath=$(runtime_dir)/ssh-$(path_key "$1").ctl"
     -o ControlPersist=120)
   if [ "${BATCH:-0}" = 1 ]; then
     SSH_OPTS+=(-o BatchMode=yes)
@@ -307,7 +318,7 @@ ensure_forward() {
   # Panes bridging the same session race to create the same forward. A run
   # that dies inside this section leaves the lock behind; the next one
   # reclaims it once the owning pid is gone.
-  lock_acquire "$host-$session"
+  lock_acquire "$host" "$session"
 
   if ! socket_alive "$sock"; then
     rm -f "$sock" "$csock"
@@ -319,7 +330,7 @@ ensure_forward() {
     wait_for_socket "$sock"
   fi
 
-  lock_release "$host-$session"
+  lock_release "$host" "$session"
   printf '%s' "$sock"
 }
 

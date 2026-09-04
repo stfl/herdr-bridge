@@ -171,11 +171,11 @@ teardown() { hb_teardown; }
 @test "a second holder waits for the lock to be released" {
   run bash -c 'source "$HB_BIN"
     ensure_runtime_dir
-    lock_acquire probe
-    ( lock_acquire probe && echo SECOND_ENTERED ) &
+    lock_acquire probe p
+    ( lock_acquire probe p && echo SECOND_ENTERED ) &
     sleep 0.4
     echo FIRST_STILL_HOLDS
-    lock_release probe
+    lock_release probe p
     wait'
   [ "$status" -eq 0 ]
   [[ "$output" == *FIRST_STILL_HOLDS*SECOND_ENTERED* ]]
@@ -184,10 +184,33 @@ teardown() { hb_teardown; }
 @test "a stale lock left by a dead process is broken, not waited on forever" {
   run bash -c 'source "$HB_BIN"
     ensure_runtime_dir
-    mkdir -p "$(runtime_dir)/stale.lock"
-    echo 999999 >"$(runtime_dir)/stale.lock/pid"
-    LOCK_TIMEOUT=2 lock_acquire stale && echo ACQUIRED
-    lock_release stale'
+    mkdir -p "$(lock_path stale s)"
+    echo 999999 >"$(lock_path stale s)/pid"
+    LOCK_TIMEOUT=2 lock_acquire stale s && echo ACQUIRED
+    lock_release stale s'
   [ "$status" -eq 0 ]
   [[ "$output" == *ACQUIRED* ]]
+}
+
+@test "a host name cannot escape the runtime directory" {
+  # host and session reach path construction, and the lock is removed with
+  # rm -rf, so traversal in either would be removal outside our own directory.
+  run bash -c 'source "$HB_BIN"; local_socket "../../../tmp/pwn" "s"'
+  [ "$status" -eq 0 ]
+  [[ "$output" != *..* ]]
+  [[ "$output" == "$HERDR_BRIDGE_RUNTIME_DIR/"* ]]
+}
+
+@test "a session name cannot escape the lock directory" {
+  run bash -c 'source "$HB_BIN"; lock_path "h" "../../../tmp/pwn"'
+  [ "$status" -eq 0 ]
+  [[ "$output" != *..* ]]
+  [[ "$output" == "$HERDR_BRIDGE_RUNTIME_DIR/"* ]]
+}
+
+@test "an ssh target with @ or : still yields a usable file name" {
+  run bash -c 'source "$HB_BIN"; local_socket "user@host.example.com" "api"'
+  [ "$status" -eq 0 ]
+  [[ "$output" == "$HERDR_BRIDGE_RUNTIME_DIR/"*.sock ]]
+  [[ "$(basename "$output")" != *@* ]]
 }

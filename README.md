@@ -139,6 +139,24 @@ rows = [
 - **The remote host needs `herdr` on a non-interactive `PATH`**, since the
   session is queried over `ssh host herdr ...`.
 
+## Related work
+
+Unifying several herdr servers in one sidebar is
+[discussion #515](https://github.com/herdrdev/herdr/discussions/515) upstream,
+where the maintainer has called it the top priority and said he intends to
+build it on herdr's reworked client-server architecture himself. Treat this
+tool as something to use until that lands, not as a bid to pre-empt it.
+
+[herdr-mirror](https://github.com/nikok6/herdr-mirror) already does more than
+this does: a Rust herdr plugin with a daemon that reconciles whole remote
+workspaces into local mirror panes, streams their terminals and pushes agent
+status. If you want your remote workspaces mirrored, use that.
+
+`herdr-bridge` is the small version of the idea. It is one bash script with no
+plugin to install and nothing to compile, it runs against stable herdr rather
+than tracking preview builds, and it bridges exactly one agent into exactly
+one pane you chose. That is the whole scope.
+
 ## Development
 
 ```sh
