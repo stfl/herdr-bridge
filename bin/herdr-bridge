@@ -207,11 +207,24 @@ lock_acquire() {
   local dir owner waited=0
   dir="$(lock_path "$1" "$2")"
   while ! mkdir "$dir" 2>/dev/null; do
-    # A lock whose owner died would otherwise block every later run. The
+    # Anything that is not a directory here was never a lock this code took,
+    # and carries no owner to judge staleness by. It would block every later
+    # run forever, so it goes.
+    if [ -e "$dir" ] && [ ! -d "$dir" ]; then
+      rm -f "$dir"
+      continue
+    fi
+    # A lock whose owner died would otherwise block every later run too. The
     # runtime directory is private to one user, so every holder is ours to
     # signal.
     owner=$(cat "$dir/pid" 2>/dev/null || true)
     if [ -n "$owner" ] && ! kill -0 "$owner" 2>/dev/null; then
+      rm -rf "$dir"
+      continue
+    fi
+    # A holder killed between mkdir and recording its pid leaves a directory
+    # nothing can ever judge. Give it a grace period, then reclaim it.
+    if [ -z "$owner" ] && [ "$waited" -gt 20 ]; then
       rm -rf "$dir"
       continue
     fi

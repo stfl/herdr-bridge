@@ -214,3 +214,27 @@ teardown() { hb_teardown; }
   [[ "$output" == "$HERDR_BRIDGE_RUNTIME_DIR/"*.sock ]]
   [[ "$(basename "$output")" != *@* ]]
 }
+
+@test "a leftover file at the lock path does not block forever" {
+  # An earlier implementation held the lock as a file. mkdir can never
+  # succeed against one, and it carries no pid to judge staleness by, so it
+  # would wedge every later run.
+  run bash -c 'source "$HB_BIN"
+    ensure_runtime_dir
+    : >"$(lock_path h s)"
+    LOCK_TIMEOUT=3 lock_acquire h s && echo ACQUIRED
+    lock_release h s'
+  [ "$status" -eq 0 ]
+  [[ "$output" == *ACQUIRED* ]]
+}
+
+@test "a lock directory with no owner recorded is reclaimed" {
+  # A holder killed between mkdir and writing its pid leaves exactly this.
+  run bash -c 'source "$HB_BIN"
+    ensure_runtime_dir
+    mkdir -p "$(lock_path h s)"
+    LOCK_TIMEOUT=5 lock_acquire h s && echo ACQUIRED
+    lock_release h s'
+  [ "$status" -eq 0 ]
+  [[ "$output" == *ACQUIRED* ]]
+}
