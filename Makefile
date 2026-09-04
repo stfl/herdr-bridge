@@ -12,7 +12,8 @@ test:
 
 lint:
 	shellcheck --shell=bash bin/herdr-bridge
-	shellcheck --shell=bash test/helpers/stub-herdr test/helpers/stub-ssh
+	shellcheck --shell=bash test/helpers/stub-herdr test/helpers/stub-ssh \
+	  test/helpers/lock-victim test/helpers/lock-waiter
 	shellcheck --shell=bash completions/herdr-bridge.bash
 	bash -n completions/herdr-bridge.bash
 	@if command -v zsh >/dev/null; then zsh -n completions/herdr-bridge.zsh; \

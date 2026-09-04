@@ -1,0 +1,5 @@
+{"sessions":[
+ {"default":true,"name":"default","running":true,"session_dir":"/home/u/.config/herdr","socket_path":"/home/u/.config/herdr/herdr.sock"},
+ {"default":false,"name":"$(touch $HB_INJECT_MARKER)","running":true,"session_dir":"/home/u/x","socket_path":"/home/u/x/herdr.sock"},
+ {"default":false,"name":"`touch $HB_INJECT_MARKER.bt`","running":true,"session_dir":"/home/u/y","socket_path":"/home/u/y/herdr.sock"}
+]}

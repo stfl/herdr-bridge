@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+# One contender, a separate process with its own pid, as panes are.
+#
+# Entry and exit are logged and replayed for maximum concurrency rather than
+# checked against a sentinel: a sentinel is itself check-then-act, two
+# entrants can both find it absent, and the first leaver erases it while a
+# second holder is still inside — so every overlap after the first is
+# invisible.
+set -uo pipefail
+# shellcheck disable=SC1090
+source "$HB_BIN"
+
+# HB_DELAY staggers when each contender acts on the owner pid it read. A
+# uniform delay shifts every contender equally and leaves the interleaving
+# untouched; the stagger is what exposes a verdict formed before another
+# reclaimer completed.
+# The delay follows the read, not precedes it: the point is a verdict formed
+# early and acted on late. Delaying the read itself just makes it fresh.
+if [ -n "${HB_DELAY:-}" ]; then
+  cat() {
+    command cat "$@"
+    local rc=$?
+    sleep "$HB_DELAY"
+    return "$rc"
+  }
+fi
+
+LOCK_TIMEOUT=30 lock_acquire h s
+printf '+ %s\n' "$$" >>"$HB_LOG"
+sleep "${HB_HOLD:-0.02}"
+printf -- '- %s\n' "$$" >>"$HB_LOG"
+lock_release h s

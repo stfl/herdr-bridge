@@ -54,6 +54,7 @@ usage:
   $PROG [options] <host>[:<session>[:<remote-pane>]]
   $PROG --list [<host>[:<session>]]
   $PROG --release
+  $PROG --disconnect <host>
 
 arguments:
   host          ssh target running a herdr server
@@ -64,6 +65,7 @@ arguments:
 options:
   --list        list sessions on a host, or agents in a session
   --release     clear a mirrored row stuck on this pane after a hard kill
+  --disconnect  close the shared SSH connection to a host
   --takeover    take input ownership if another client already owns the pane
   --interval N  seconds between state polls (default: $interval)
   --ttl N       ms before a mirrored sidebar row expires (default: $ttl_ms)
@@ -208,58 +210,122 @@ now_ms() {
   printf '%s' "$ms"
 }
 
-# flock(1) is util-linux, so it does not exist on macOS. mkdir is the portable
-# atomic primitive: it either creates the directory or fails, with no window
-# in between.
-LOCK_TIMEOUT="${LOCK_TIMEOUT:-10}"
+# flock(1) is util-linux, so it does not exist on macOS. A hard link is the
+# portable atomic primitive: ln fails if the target exists, and the file it
+# publishes already contains the owner's pid — so unlike mkdir there is never
+# a window where a lock exists with no owner recorded.
+#
+# The suffix is deliberately not the one an earlier version used for its
+# directory lock: `ln file existing-directory` creates a file *inside* the
+# directory and succeeds, so sharing a path across the two shapes would let
+# every waiter believe it had acquired the lock.
+LOCK_TIMEOUT="${LOCK_TIMEOUT:-30}"
 
-lock_path() { printf '%s/%s.lock' "$(runtime_dir)" "$(path_key "$1" "$2")"; }
+lock_path() { printf '%s/%s.lck' "$(runtime_dir)" "$(path_key "$1" "$2")"; }
+
+# Fails closed. A false "dead" is the only verdict that can hand one lock to
+# two holders, so only an unambiguous answer counts as death: kill -0 proves
+# life outright, and otherwise ps is asked — but ps failing to *run* at all,
+# which fork pressure from several panes starting at once can cause, must not
+# be mistaken for the process being gone. kill alone is not enough either,
+# since it reports EPERM for a pid owned by another user.
+pid_alive() {
+  kill -0 "$1" 2>/dev/null && return 0
+  ps -p "$1" >/dev/null 2>&1
+  case $? in
+    0) return 0 ;;
+    1) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
+# Removing a stale lock is serialised under a guard, and the verdict is formed
+# again inside it. With the guard held the lock cannot change identity — ln
+# fails while the file exists, and no other reclaimer can be running — so the
+# file removed is the file just judged dead. Forming the verdict outside and
+# acting on it later is the race this replaces: a reclaimer whose verdict
+# predates another's full cycle would delete a live successor's lock.
+lock_reclaim() {
+  local lock="$1" guard="$2" owner holder
+  if ! mkdir "$guard" 2>/dev/null; then
+    # A reclaimer killed inside the guard would otherwise block reclaim
+    # forever. Judge it by its own pid where possible: find's granularity is
+    # whole minutes, which is well past the point every waiter has given up.
+    holder=$(cat "$guard/pid" 2>/dev/null || true)
+    if [ -n "$holder" ] && ! pid_alive "$holder"; then
+      rm -rf "$guard"
+    elif [ -z "$holder" ] &&
+      [ -n "$(find "$guard" -maxdepth 0 -mmin +1 2>/dev/null)" ]; then
+      # Killed between taking the guard and recording its pid; only age can
+      # judge this one.
+      rm -rf "$guard"
+    fi
+    return 1
+  fi
+  printf '%s' "$$" >"$guard/pid" 2>/dev/null || true
+
+  if [ -d "$lock" ]; then
+    # Not a shape this code makes; nothing can own it.
+    rm -rf "$lock"
+  elif [ ! -e "$lock" ]; then
+    # Already gone, so there is nothing to reclaim. Acting on an empty read
+    # without checking existence would delete a lock that appeared in between:
+    # while the file exists nobody can publish one, but if it was absent when
+    # read, a waiter's ln may have succeeded since.
+    :
+  else
+    owner=$(cat "$lock" 2>/dev/null || true)
+    # Publication writes the pid before linking the file into place, so a lock
+    # that exists and names nobody cannot be a live one.
+    if [ -z "$owner" ] || ! pid_alive "$owner"; then
+      rm -f "$lock"
+    fi
+  fi
+
+  # Not rmdir: the guard holds its owner's pid, so it is never empty.
+  rm -rf "$guard"
+}
 
 lock_acquire() {
-  local dir owner waited=0 lost=0
-  dir="$(lock_path "$1" "$2")"
+  local lock guard mine owner waited=0
+  lock="$(lock_path "$1" "$2")"
+  guard="$lock.reclaim"
+
+  mine=$(mktemp "$lock.XXXXXX") || die "cannot stage a lock beside $lock"
+  printf '%s' "$$" >"$mine"
+
   while :; do
-    if mkdir "$dir" 2>/dev/null; then
-      # A directory removed from under us between mkdir and this write means
-      # the lock is not ours; start over rather than believe we hold it.
-      if printf '%s' "$$" >"$dir/pid" 2>/dev/null; then return 0; fi
-      lost=$((lost + 1))
-      [ "$lost" -lt 10 ] || die "could not take the lock at $dir"
-      continue
-    fi
-
-    # Anything that is not a directory here was never a lock this code took,
-    # and carries no owner to judge staleness by. It would block every later
-    # run forever, so it goes.
-    if [ -e "$dir" ] && [ ! -d "$dir" ]; then
-      rm -f "$dir"
-      continue
-    fi
-
-    owner=$(cat "$dir/pid" 2>/dev/null || true)
-    # A lock whose owner died, or one whose owner was never recorded because
-    # the holder was killed mid-acquire, is reclaimed by renaming it away
-    # first: whoever wins the rename owns the cleanup, so a waiter that has
-    # already re-created the lock cannot have it deleted underneath.
-    if { [ -n "$owner" ] && ! kill -0 "$owner" 2>/dev/null; } ||
-      { [ -z "$owner" ] && [ "$waited" -gt 20 ]; }; then
-      if mv "$dir" "$dir.$$.stale" 2>/dev/null; then
-        rm -rf "$dir.$$.stale"
-        continue
+    # A directory has to be dealt with before ln is attempted, because
+    # `ln file existing-directory` does not fail — it creates a file *inside*
+    # the directory and reports success, which would hand the lock to every
+    # waiter at once.
+    if [ -d "$lock" ]; then
+      lock_reclaim "$lock" "$guard" || true
+    elif ln "$mine" "$lock" 2>/dev/null; then
+      # Confirm what was published is the lock itself, holding our pid, and
+      # not a file created beneath something else that appeared in between.
+      if [ -f "$lock" ] && [ "$(cat "$lock" 2>/dev/null)" = "$$" ]; then
+        rm -f "$mine"
+        return 0
       fi
-      # Losing the rename means another waiter is reclaiming it; fall through
-      # to the wait rather than spinning on a directory that is already gone.
+      rm -f "$lock/${mine##*/}" 2>/dev/null || true
+    else
+      owner=$(cat "$lock" 2>/dev/null || true)
+      if [ -z "$owner" ] || ! pid_alive "$owner"; then
+        lock_reclaim "$lock" "$guard" || true
+      fi
     fi
 
     if [ "$waited" -ge "$((LOCK_TIMEOUT * 20))" ]; then
-      die "timed out waiting for the lock at $dir"
+      rm -f "$mine"
+      die "timed out waiting for the lock at $lock"
     fi
     waited=$((waited + 1))
     sleep 0.05
   done
 }
 
-lock_release() { rm -rf "$(lock_path "$1" "$2")"; }
+lock_release() { rm -f "$(lock_path "$1" "$2")"; }
 
 # ---------------------------------------------------------------------- ssh
 
@@ -278,8 +344,8 @@ ssh_opts() {
     # hanging on a master that notices nothing for as long as TCP takes to
     # give up — and ensure_forward holds the lock while it waits, which takes
     # sibling panes down with it.
-    -o ServerAliveInterval=15
-    -o ServerAliveCountMax=3
+    -o ServerAliveInterval=5
+    -o ServerAliveCountMax=2
     -o ConnectTimeout=10)
   if [ "${BATCH:-0}" = 1 ]; then
     SSH_OPTS+=(-o BatchMode=yes)
@@ -505,6 +571,19 @@ cmd_list() {
           { printf "%-10s %-8s %-8s %s\n", $1, $2, $3, $4 }'
 }
 
+# The SSH connection is deliberately shared and outlives every bridge, so it
+# needs a way to be closed. `ssh -O exit <host>` on its own cannot do it: the
+# ControlPath is set per invocation here, not in the user's ssh config, and it
+# carries a checksum nobody is going to type.
+cmd_disconnect() {
+  local host="${1-}"
+  [ -n "$host" ] || die "usage: $PROG --disconnect <host>"
+  ssh_opts "$host"
+  ssh "${SSH_OPTS[@]}" -O exit "$host" >/dev/null 2>&1 ||
+    die "no shared connection to $host"
+  printf '%s: closed the shared connection to %s\n' "$PROG" "$host"
+}
+
 cmd_release() {
   local lpane row agent host session
   lpane="${HERDR_PANE_ID:-}"
@@ -578,7 +657,7 @@ cmd_attach() {
 
 # --------------------------------------------------------------------- main
 
-REQUIRED_TOOLS=(ssh jq herdr awk)
+REQUIRED_TOOLS=(ssh jq herdr awk ps)
 
 require_tools() {
   local tool
@@ -668,6 +747,7 @@ main() {
     complete) cmd_complete ${args[@]+"${args[@]}"} ;;
     list) cmd_list ${args[@]+"${args[@]}"} ;;
     release) cmd_release ;;
+    disconnect) cmd_disconnect ${args[@]+"${args[@]}"} ;;
     attach) cmd_attach ${args[@]+"${args[@]}"} ;;
   esac
 }

@@ -10,8 +10,10 @@ case "${1:-} ${2:-}" in
     # HB_SERVER_DOWN models the case the real binary is careless about: the
     # socket file is present but nothing is listening. Either way this exits
     # 0, exactly as herdr does.
+    down=0
+    [ -n "${HB_SERVER_DOWN_FILE:-}" ] && [ -e "$HB_SERVER_DOWN_FILE" ] && down=1
     if [ -n "${HERDR_SOCKET_PATH:-}" ] && [ -S "${HERDR_SOCKET_PATH}" ] &&
-      [ "${HB_SERVER_DOWN:-0}" != 1 ]; then
+      [ "$down" != 1 ]; then
       printf 'status: running\nsocket: %s\n' "$HERDR_SOCKET_PATH"
     else
       printf 'status: not running\nsocket: %s\n' "${HERDR_SOCKET_PATH:-}"

@@ -91,6 +91,7 @@ herdr-bridge workbox                 # the host's "default" session
 
 herdr-bridge --list workbox          # sessions on a host
 herdr-bridge --list workbox:api     # agents in a session
+herdr-bridge --disconnect workbox   # close the shared SSH connection
 ```
 
 Completion walks `host` → `session` → `agent`, so an agent is picked by what
@@ -121,8 +122,15 @@ close the pane instead. A hard kill can strand a row, and
 `herdr-bridge --release` clears it from the pane it is stuck on.
 
 The SSH forward outlives the bridge on purpose, so several panes and repeated
-runs share one connection. `ssh -O exit <host>` closes it, and the multiplexed
-master expires on its own after two idle minutes.
+runs share one connection, and it stays up until the host is unreachable or
+you close it:
+
+```sh
+herdr-bridge --disconnect workbox
+```
+
+`ssh -O exit workbox` will not do it: the control path is set per invocation
+rather than in your ssh config, so plain ssh cannot find the connection.
 
 ### Showing the host in the sidebar
 

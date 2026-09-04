@@ -28,5 +28,11 @@ s = socket.socket(socket.AF_UNIX)
 s.bind(sys.argv[1])' "$local_sock"
 done
 
+# Building the forward brings the server back, so a test can assert the
+# recovery and not just the attempt.
+if [ ${#forwards[@]} -gt 0 ] && [ -n "${HB_SERVER_DOWN_FILE:-}" ]; then
+  rm -f "$HB_SERVER_DOWN_FILE"
+fi
+
 if [ ${#cmd[@]} -gt 0 ]; then exec "${cmd[@]}"; fi
 exit 0

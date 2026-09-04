@@ -149,9 +149,12 @@ hb_wait_for() {
   python3 -c 'import socket,sys
 s = socket.socket(socket.AF_UNIX)
 s.bind(sys.argv[1])' "$HERDR_BRIDGE_RUNTIME_DIR/$(bash -c 'source "$HB_BIN"; path_key workbox api').sock"
-  export HB_SERVER_DOWN=1
+  : >"$HB_SERVER_DOWN_FILE"
   run "$HB_BIN" --list workbox:api
+  # Rebuilt, and the rebuild is what brings the session back.
   [ -n "$(hb_calls_matching '-L ')" ]
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"w5:p1"* ]]
 }
 
 @test "the mirror keeps republishing while the attach lives" {
